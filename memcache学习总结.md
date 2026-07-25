@@ -1861,3 +1861,277 @@ token 轴 →
 3. **抢占只发生在 RUNNING 循环**：running 请求可以杀别人求生（while True 重试），waiting 请求分配失败只是 break 等下轮——保证已跑请求不被饿死；
 4. **先还后借**：`remove_skipped_blocks` 在检查容量之前调用，滑窗类模型能自我腾出空间；
 5. **命中块的接管是原子的**：`allocate_new_computed_blocks` 在确认容量足够后才 touch 命中块，避免"查找时命中、分配时已淘汰"的竞态。
+
+---
+
+## put_from 完整流程 与 KV cache 的优先落点
+
+### 问题：调用 memcache 的 put_from 接口的完整流程是怎样的？会优先把 KV cache 张量存在哪里？
+
+#### 一、put_from 完整流程（跨 3 个进程/模块）
+
+```
+vLLM/客户端进程                    MetaService 进程                 存储节点
+┌─────────────────────────┐
+│① store.put_from(key,    │
+│   buf_ptr, size,        │
+│   direct=H2G, repCfg)   │
+│   (pymmc.cpp:721)       │
+└──────────┬──────────────┘
+           ▼
+② MmcacheStore::PutFrom (mmcache_store.cpp:228)
+   direct 决定【源 buffer】在哪：L2G→本地HBM / H2G→本地Host DRAM
+   CopyPutOptions: policy=NATIVE_AFFINITY, replicaNum=repCfg.replicaNum(默认1)
+           │
+           ▼
+③ MmcClientDefault::Put (mmc_client_default.cpp:212)
+   PrepareAllocOpt:
+     blobSize_=size, numBlobs_=replicaNum
+     mediaType_=MEDIA_NONE        ← 客户端不指定存到哪层！
+     preferredRank_=自己的rankId   ← NATIVE_AFFINITY 本地亲和(mmc_client_default.h:200)
+           │
+           │ ④ AllocRequest ──RPC──> ┌────────────────────────────────┐
+           │                        │⑤ MmcMetaMgrProxy::Alloc        │
+           │                        │  CheckAndEvict(先按水位淘汰腾空间)│
+           │                        │⑥ MmcMetaManager::Alloc         │
+           │                        │  globalAllocator_->Alloc:      │
+           │                        │   media==NONE→选最高层(见下文)   │
+           │                        │   优先在 preferredRank 节点分配  │
+           │                        │  blob(ALLOCATED)挂到 objMeta,   │
+           │                        │  Insert 进 LRU 容器             │
+           │<─RPC─ ⑦返回blob描述─────┤   {rank, gva, media, size}    │
+           │                        └────────────────────────────────┘
+           ▼
+⑧ for 每个 blob: bmProxy_->BatchPut(bufArr, blob)
+   本地 local service 按 gva 把数据写入全局池  ──────────> RDMA/sdma/shm 拷贝
+           │                                                (写到⑦返回的地址)
+           ▼
+⑨ SyncUpdateState: 每个 blob 上报 WRITE_OK / WRITE_FAIL ──> meta 推进状态机
+                                                              ALLOCATED→READABLE
+```
+
+关键步骤说明：
+
+| 步骤 | 做什么 | 代码位置 |
+|---|---|---|
+| ② | `direct` 只标注**源** buffer 位置（H2G=数据在 Host DRAM，L2G=数据在 NPU HBM），**不决定存到哪** | `mmcache_store.cpp:231-243` |
+| ③ | 组分配请求：大小、副本数、**介质填 MEDIA_NONE（让服务端定）**、亲和节点 | `mmc_client_default.cpp:186-210` |
+| ⑤ | 分配前先按高低水位淘汰，腾出空间 | `mmc_meta_mgr_proxy.cpp:52` |
+| ⑥ | 全局分配器选层、选节点，创建 ALLOCATED 状态的 blob 并插入 LRU 容器 | `mmc_global_allocator.h:56` |
+| ⑧ | 真正的数据拷贝，按返回的 gva 写 | `mmc_client_default.cpp:241` |
+| ⑨ | **同步**上报写结果，blob 变 READABLE 才对读可见 | `mmc_client_default.cpp:255` |
+
+另外：key 已存在时 meta 返回 `MMC_DUPLICATED_OBJECT`（`mmc_client_default.cpp:225`），不会覆盖写。
+
+#### 二、KV cache 会优先存在哪里？
+
+##### 介质层：客户端说了不算，服务端选"当前最高层"
+
+put_from 的分配请求里 `mediaType_ = MEDIA_NONE`（`mmc_client_default.cpp:191`），最终由全局分配器决定（`mmc_global_allocator.h:66-68`）：
+
+```cpp
+if (allocReq.mediaType_ == MEDIA_NONE) {
+    allocReq.mediaType_ = GetTopLayerMediumType();   // 选集群里配置的最高层
+}
+```
+
+`GetTopLayerMediumType()`（`mmc_global_allocator.h:366`）取 `allocators_` map 的第一个 key，而 `MmcLocation::operator<` **先比较介质类型**（`mmc_types.h:149-157`，HBM=0 < DRAM=1 < SSD=2），所以：
+
+```
+集群配置                     put_from 的落点
+┌─────────────────────┐     ┌──────────────┐
+│ hbm.size > 0        │ ──> │ HBM（最高层） │
+├─────────────────────┤     ├──────────────┤
+│ hbm.size = 0        │ ──> │ DRAM         │
+│ (仅 DRAM + SSD)     │     │              │
+├─────────────────────┤     ├──────────────┤
+│ SSD                 │ ──> │ 永远不会被直接 │
+│                     │     │ 写入，只通过  │
+│                     │     │ 淘汰降级获得  │
+└─────────────────────┘     └──────────────┘
+```
+
+##### 节点：优先本地节点
+
+`policy = NATIVE_AFFINITY` → `preferredRank_ = 客户端自己的 rankId`（`mmc_client_default.h:200-208`），分配器按本地亲和策略优先把 blob 分在**发起写入的这个节点**上，利用本地内存带宽、避免跨节点流量。如果 `ReplicateConfig.preferredLocalServiceIDs` 指定了节点列表，则强制分配到那些节点（`ALLOC_FORCE_BY_RANK`）。
+
+##### 结论
+
+```
+put_from 写入一份 KV cache 的完整去向：
+
+  源（direct 指定）                目的地（服务端决定）
+  NPU HBM  (L2G)  ──┐         ┌─> 集群有 HBM 池：本节点 HBM
+                    ├─────────┤
+  Host DRAM (H2G) ──┘         └─> 无 HBM 池：   本节点 DRAM
+                                  （SSD 只能靠后续淘汰降级到达）
+```
+
+也就是说：**热数据总是落在最快的介质、最近的节点上**；之后随着 LRU 变冷，才被逐级淘汰到 DRAM → SSD。想显式指定介质（比如强制进 DRAM）的话，put_from 做不到，需要用 `batch_alloc(media=...)` + `batch_copy` 的 GVA 直写流程。
+
+---
+
+## Q&A：kv_connector_model_runner_mixin 中的 forward 含义与流程
+
+> **原始问题：** kv_connector_model_runner_mixin 中的 forward 是什么含义？这个 forward 都会做哪些事情？
+
+### "forward" 的含义
+
+这里的 **forward = 模型的一次前向传播**：把本步调度好的 token 批次送入模型，从 embedding 经过 N 层 transformer 算出 hidden states / logits 的过程。一次 `execute_model` = 一个调度步 = 一次 forward（整批请求一起算）。
+
+mixin 文件名里的 "model_runner_mixin" 表明它是给 ModelRunner 加的**连接器钩子**，核心是把 KV 传输动作"挂"在 forward 的前后边缘上。
+
+### forward 前后都做什么（`gpu_model_runner.py:4416-4440`）
+
+```python
+with (
+    set_forward_context(attn_metadata, self.vllm_config, ...),   # ① 建立全局 forward 上下文
+    self.maybe_get_kv_connector_output(scheduler_output, ...)    # ② connector 上下文管理器
+        as kv_connector_output,
+):
+    model_output = self._model_forward(input_ids, positions, ...) # ③ 真正的前向计算
+```
+
+② 就是 mixin 的 `_get_kv_connector_output`（`kv_connector_model_runner_mixin.py:78-112`），按时间顺序：
+
+```
+【forward 之前】
+  a. bind_connector_metadata(scheduler_output.kv_connector_metadata)   (:89)
+     把 scheduler 打包的 ReqMeta（load_spec/block_ids 等）绑到 connector
+  b. start_load_kv(get_forward_context())                              (:95)
+     启动本步的 KV 加载 —— 对 AscendStore 就是 MemcacheBackend.get，
+     把 memcache 里命中的前缀 KV 灌进本地块（异步发起，不等完成）
+
+【forward 之中】（模型逐层执行，由 attention 层代码触发，不在 mixin 里）
+  c. wait_for_layer_load(layer_name)  ← layerwise 模式：算第 i 层前确保
+                                        第 i 层 KV 已加载到位
+  d. save_kv_layer(layer_name, ...)   ← layerwise 模式：第 i 层算完立即
+                                        发起该层 KV 的 put，边算边存
+
+【forward 之后】（finally 块，:98-112）
+  e. wait_for_save()                 等非 layerwise 的 KV 回存完成
+                                     —— AscendStore 在此把新算的 KV
+                                     put 进 memcache（queue.join 屏障）
+  f. get_finished(finished_req_ids)  收集"已发完/已收完"的请求，
+                                     回报 scheduler 释放 block
+  g. get_block_ids_with_load_errors  收集加载失败的块（触发重算）
+  h. 收集 stats / kv_cache_events / worker_meta
+  i. clear_connector_metadata()      清理本步元数据
+```
+
+另外两个相关静态方法：
+
+- **`kv_connector_no_forward`**（:36-48）：某一步**没有任何 token 要算**（比如纯传输步）时，跳过模型 forward，但仍然走一遍 start_load/get_finished——KV 传输不因此停摆；
+- **`finalize_kv_connector`**（:64-72）：投机解码场景下 draft 模型也要跑 forward，`wait_for_save` 被推迟（`defer_finalize=True`）到 draft 跑完后再统一收尾（对应 `gpu_model_runner.py:4737` 的注释）。
+
+一句话总结：**mixin 把一次 forward 夹成"三明治"——进 forward 前发 `get`（取远端 KV），出 forward 后做 `put`（存新 KV）并回传完成状态；forward 本身（③）对 connector 无感知，只在 layerwise 模式下被逐层打断同步。** 这也正是 memcache 链路图里 "start_load_kv → forward → wait_for_save" 三段在 vLLM 侧的落点。
+
+---
+
+## Q&A：ModelRunner 连接器钩子（Mixin）如何生效、用了什么 Python 语法
+
+> **原始问题：** "model_runner_mixin" 表明它是给 ModelRunner 加的连接器钩子，这个钩子具体是怎么生效的？使用了 python 的什么语法？
+
+靠的是 Python 的 **Mixin 模式 + 多重继承**，再叠加 `@staticmethod`、`@contextmanager` 两个语法点。逐层拆解：
+
+### 1. 生效方式：多重继承（Mixin 模式）
+
+定义处（`gpu_model_runner.py:453-455`）：
+
+```python
+class GPUModelRunner(
+    LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
+):
+```
+
+`KVConnectorModelRunnerMixin` 本身（`kv_connector_model_runner_mixin.py:34`）是一个**普通类**，不继承任何东西、没有 `__init__`、不存任何状态——它只提供一组方法。通过把它列进 `GPUModelRunner` 的基类列表，这些方法就进了类的 MRO（方法解析顺序），于是 `execute_model` 里可以直接写：
+
+```python
+self.maybe_get_kv_connector_output(scheduler_output, ...)   # gpu_model_runner.py:4429
+```
+
+`self` 上并没有定义这个方法，Python 沿 MRO 找到 mixin 里的实现——这就是"钩子生效"的瞬间：**ModelRunner 的类定义处把 mixin 混进来，execute_model 的调用点把它用起来**。
+
+vllm-ascend 侧再传一代（`vllm_ascend/worker/v2/model_runner.py:59`）：
+
+```python
+class NPUModelRunner(GPUModelRunner):   # 传递继承，mixin 方法继续可用
+```
+
+（顺带一提：同目录 `model_runner_v1.py:280` 有个 `class NPUModelRunner(MemcacheBackend):` 的写法，但该文件里并没有 import 这个名字，属于这个本地快照里的异常代码，真正的继承链看 v2。）
+
+### 2. 语法点一：`@staticmethod`——无状态的工具方法
+
+mixin 里所有方法都是 `@staticmethod`（:35、:51、:64、:76…）。这是刻意设计：
+
+- mixin **不持有任何实例状态**（没有 `self.xxx`），所以不需要 `self`、不需要 `__init__`，也就避开了多重继承下 `super().__init__()` 链式调用的麻烦；
+- 调用时虽然写 `self.maybe_get_kv_connector_output(...)`，但实际不依赖实例，语义上等价于"命名空间里的函数"。
+
+那状态从哪来？答案是**进程级单例 + 线程上下文**，而不是实例属性：
+
+```python
+kv_connector = get_kv_transfer_group()      # :86  进程全局 connector（ensure_kv_transfer_initialized 设置）
+kv_connector.start_load_kv(get_forward_context())  # :95  当前 forward 上下文也是全局的
+```
+
+这正是 mixin 能"无状态"的原因：connector 对象由 `kv_transfer_state.py` 的模块全局 `_KV_CONNECTOR_AGENT` 保管，forward 上下文由 `set_forward_context` 保管，mixin 只负责在正确的时机取用。
+
+### 3. 语法点二：`@contextmanager`——生成器变成上下文管理器
+
+钩子的核心 `_get_kv_connector_output`（:76-112）：
+
+```python
+@staticmethod
+@contextmanager                                   # ← contextlib.contextmanager
+def _get_kv_connector_output(scheduler_output, ...) -> Generator[KVConnectorOutput, None, None]:
+    output = KVConnectorOutput()
+    kv_connector.bind_connector_metadata(...)     # 【进入时执行】
+    kv_connector.start_load_kv(get_forward_context())
+    try:
+        yield output                              # ← 把控制权交还给 with 体（跑模型 forward）
+    finally:
+        kv_connector.wait_for_save()              # 【退出时执行，无论是否异常】
+        output.finished_sending, output.finished_recving = kv_connector.get_finished(...)
+        ...
+```
+
+`@contextmanager` 把一个**生成器函数**包装成上下文管理器，规则是：
+
+- `yield` **之前**的代码 = `__enter__`：forward 前发 `get`（load KV）；
+- `yield` 的值 = `with ... as kv_connector_output` 里 `as` 拿到的对象；
+- `yield` **之后/finally** 的代码 = `__exit__`：forward 后做 `put`（save KV）、收集完成状态——`finally` 保证即使 forward 抛异常也会收尾。
+
+于是调用方才写得出那段"三明治"（`gpu_model_runner.py:4416-4440`）：
+
+```python
+with (
+    set_forward_context(...),                          # 另一个上下文管理器
+    self.maybe_get_kv_connector_output(...) as kv_connector_output,
+):
+    model_output = self._model_forward(...)            # forward 被夹在中间
+```
+
+### 4. 一个配套技巧：`nullcontext` 兜底
+
+`maybe_get_kv_connector_output`（:51-61）在没配 KV connector 时返回 `nullcontext()`（Python 标准库的空上下文管理器），有配时才返回真钩子：
+
+```python
+return (
+    KVConnectorModelRunnerMixin._get_kv_connector_output(...)
+    if has_kv_transfer_group()
+    else nullcontext()        # 什么都不做的占位符，as 值为 None
+)
+```
+
+这样 `execute_model` 的 `with` 语句**不需要 if/else 分支**——有没有 connector，调用形式完全一样。
+
+### 总结
+
+| 语法/机制 | 作用 |
+|---|---|
+| **多重继承 + Mixin** | `GPUModelRunner(..., KVConnectorModelRunnerMixin, ...)` 把钩子方法混进 runner 的 MRO，`self.xxx()` 即可调用 |
+| **`@staticmethod`** | mixin 纯行为、零状态，避开多继承的 `__init__` 协作问题；状态靠 `get_kv_transfer_group()` / `get_forward_context()` 全局获取 |
+| **`@contextmanager`** | 生成器 `yield` 前后天然形成"forward 前/后"两个钩子点，`finally` 保证异常安全收尾 |
+| **`nullcontext`** | 无 connector 时的空实现，统一调用点 |
+
+设计精髓：**mixin 管"时机"（什么时候 load/save），connector 管"策略"（怎么 load/save，是 memcache 还是 mooncake）**——换后端只换 `kv_transfer_config` 里的 connector 类，runner 和 mixin 一行都不用改。
