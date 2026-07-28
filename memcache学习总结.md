@@ -1383,7 +1383,7 @@ objMeta.numBlobs_ = 0;   // 返回"现在没有可读的 blob"
 
 ```
 时间 ──────────────────────────────────────────────────────────────────────▶
-
+图中的Wokrker指的是vllm-ascend中的KVPoolWorker。 它由 AscendStoreConnector【vllm-ascend】 创建，AscendStoreConnector是 KVConnectorBase_V1【vllm】的一个实现。   
 ┌─ 阶段0：Worker 进程初始化（整个生命周期只跑一次）───────────────────────────┐
 │                                                                            │
 │  vLLM Worker.init / KVConnectorFactory.create_connector(WORKER)            │
@@ -1391,9 +1391,9 @@ objMeta.numBlobs_ = 0;   // 返回"现在没有可读的 blob"
 │      ▼                                                                     │
 │  ① __init__(parallel_config, lazy_init)                                    │
 │      ├─ get_world_group().local_rank        # 确定本 rank 的 NPU 设备号    │
-│      ├─ 非 lazy ──▶ _setup_store() ──▶ DistributedObjectStore().init()    │
+│      ├─ __init__backend: 非 lazy ──▶ _setup_store() ──▶ DistributedObjectStore().init()    │
 │      │              [A2: 先 all_gather warmup]   ★store 就绪               │
-│      └─ lazy(DSV4)──▶ store=None，推迟到第一次 put                          │
+│      └─ __init__backend: lazy(DSV4)──▶ store=None，推迟到第一次 put                          │
 │      │                                                                     │
 │      ▼  (model runner 分配完 KV cache 后)                                  │
 │  ② register_buffer(ptrs, sizes)   ◀── KVPoolWorker.register_kv_caches      │
@@ -1405,6 +1405,7 @@ objMeta.numBlobs_ = 0;   // 返回"现在没有可读的 blob"
 │         [发送线程 / 接收线程 各调一次]                                      │
 └────────────────────────────────────────────────────────────────────────────┘
 
+ 下面的Scheduler指的是vllm-ascend中的AscendStoreConnector.KVPoolScheduler，LookupKeyServer也是vllm-ascend中的
 ┌─ 阶段1：每个新请求 · 调度期（scheduler 进程发起，rank0 worker 执行）────────┐
 │                                                                            │
 │  Scheduler.get_num_new_matched_tokens()                                    │
@@ -1412,10 +1413,11 @@ objMeta.numBlobs_ = 0;   // 返回"现在没有可读的 blob"
 │                        │                                                   │
 │                        ▼                                                   │
 │                   ④ exists(keys) ──▶ batch_is_exist                        │
-│                      [每个 kv group 一次；TP/PP 变体展开后一批查完]         │
-│                      [lazy 且未初始化 → 直接返回全 0，视为未命中]           │
+                       res = self.m_store.exists(multi_tp_keys)              │
+│                      [每个 kv group 一次；TP/PP 变体展开后一批查完]              │
+│                      [lazy 且未初始化 → 直接返回全 0，视为未命中]                │
 │                        │                                                   │
-│                   命中 token 数 ◀──ZMQ RESP── 回到 scheduler，决定分配      │
+│                   命中 token 数 ◀──ZMQ RESP── 回到 scheduler，决定分配         │
 └────────────────────────────────────────────────────────────────────────────┘
 
 ┌─ 阶段2：每个命中请求 · forward 之前（本 rank worker，load 路径）────────────┐
@@ -2135,3 +2137,249 @@ return (
 | **`nullcontext`** | 无 connector 时的空实现，统一调用点 |
 
 设计精髓：**mixin 管"时机"（什么时候 load/save），connector 管"策略"（怎么 load/save，是 memcache 还是 mooncake）**——换后端只换 `kv_transfer_config` 里的 connector 类，runner 和 mixin 一行都不用改。
+
+---
+
+## Q&A：_try_schedule_encoder_inputs 方法的请求与返回值含义详解
+
+> **原始问题：** 详细解释一下 _try_schedule_encoder_inputs 方法的请求和返回都代表什么含义。
+
+（依据：`scheduler.py:1379-1406` 签名与 docstring、`:1407-1537` 全部实现。）
+
+### 一、方法定位
+
+这是 schedule() 在**多模态请求**上的前置过滤器：在正式分配 KV block 之前，先回答一个问题——**"本步要算的这段 token 里，涉及哪些图片？这些图的 vision encoder 计算本步能不能安排？"** 回答不了（缓存满/预算尽）就砍短本步的 token 数，宁可少算也不能让 decoder "读过"一张还没编码的图。
+
+两个调用点：RUNNING 循环（`:526-538`）和 WAITING 循环（`:863-875`），签名和语义完全一致。
+
+### 二、输入参数（5 个）
+
+```python
+def _try_schedule_encoder_inputs(
+    self,
+    request: Request,               # ①
+    num_computed_tokens: int,       # ②
+    num_new_tokens: int,            # ③
+    encoder_compute_budget: int,    # ④
+    shift_computed_tokens: int = 0, # ⑤
+) -> tuple[list[int], int, int, list[int]]:
+```
+
+| # | 参数 | 含义 |
+|---|---|---|
+| ① | `request` | 当前要调度的请求。方法只读它的 `mm_features`：每个 mm 输入（一张图/一段视频）带三个关键属性——`identifier`（内容哈希，查缓存用）、`mm_position.offset`（占位 token 在序列中的起始位置）、`mm_position.length`（占位 token 数）、`get_num_embeds()`（编码后产生多少条 embedding） |
+| ② | `num_computed_tokens` | 该请求**已经算完**的 token 数（含本地前缀缓存命中 + KV connector 外部命中，docstring :1404-1405 特别注明）。它是本步调度窗口的**左边界** |
+| ③ | `num_new_tokens` | 本步**计划新算**的 token 数（预算裁剪后的值）。右边界 = ② + ③。方法可能把它**改小**后返回 |
+| ④ | `encoder_compute_budget` | 本调度步剩余的 **encoder 算力预算**（`max_num_encoder_input_tokens`，按 embedding 条数计，全步所有请求共享）。每安排一个图的本地编码就扣掉它的 embeds 数，花完后面的请求就用不了 |
+| ⑤ | `shift_computed_tokens` | EAGLE 投机解码的位置偏移（`use_eagle` 时传 1，否则 0）。投机场景下序列位置整体平移 1，判断"图是否落在窗口内"时必须带上这个偏移，否则会误判覆盖关系导致缓存误失效 |
+
+**核心概念——调度窗口**：`[num_computed_tokens, num_computed_tokens + num_new_tokens)`。方法只关心**与这个窗口有重叠**的 mm 输入（`:1421-1425` 的 `get_mm_features_in_window`），窗口外的图本步不管。
+
+### 三、返回值（4 元组）
+
+```python
+return (
+    encoder_inputs_to_schedule,   # ① list[int]
+    num_new_tokens,               # ② int（可能被裁小）
+    encoder_compute_budget,       # ③ int（扣减后的剩余预算）
+    external_load_encoder_input,  # ④ list[int]
+)
+```
+
+| # | 返回值 | 含义 | 调用方拿它做什么 |
+|---|---|---|---|
+| ① | `encoder_inputs_to_schedule` | **本步要在本地跑 vision encoder 的 mm 输入下标列表**（`request.mm_features` 的索引）。入选条件（docstring :1391-1398）：与窗口重叠 + 不在本地 encoder 缓存 + 不在远端 EC 缓存 + 预算够 + 缓存有空间 | 调用方逐个 `encoder_cache_manager.allocate(request, i)` 占坑（`:647/:1034`），并写入 `SchedulerOutput.scheduled_encoder_inputs` → model runner 据此真正执行 vision encoder |
+| ② | `num_new_tokens` | **裁剪后的新 token 数**。当某个图的编码安排不下时，把 token 数砍到**该图起点之前**（`:1489-1494`）；若图起点已经被越过（前缀缓存导致 `num_computed > start_pos`）则直接砍成 0（`:1495-1500`） | 为 0 时请求本步完全让路（RUNNING 循环 `continue`，WAITING 循环 `break`）；否则按新值继续走 KV block 分配 |
+| ③ | `new_encoder_compute_budget` | **扣除本请求消耗后的剩余算力预算**。注意只扣本地编码的图（`:1528`）；远端加载的不扣（不耗本地算力，`:1524` 只计入 `num_embeds_to_schedule` 占空间） | 传回给循环，供本步后续请求继续使用 |
+| ④ | `external_load_encoder_input` | **命中远端 EC connector 缓存**的 mm 输入下标（`:1519-1525`）。这些图不用本地重算，但仍需占缓存坑位，等 worker 从远端加载 | 调用方同样 `allocate` 占坑（`:653/:1041`），并通知 `ec_connector.update_state_after_alloc` |
+
+**提前返回**（`:1407-1408`）：`num_new_tokens == 0` 或请求没有 mm 输入时，原样返回 `([], num_new_tokens, budget, [])`——纯文本请求的零成本快路径。
+
+### 四、内部决策逻辑（一张图的"命运"如何决定）
+
+```
+对窗口内每个 mm 输入 i（按位置顺序遍历）:
+    │
+    ├─ 0. encoder-decoder 模型且已算过 decoder token → skip（:1437-1451）
+    │
+    ├─ 1. 同一张图(identifier 相同)本步已安排过 → skip，去重（:1456-1459）
+    │
+    ├─ 2. check_and_update_cache 命中本地 encoder 缓存
+    │      → 登记引用，本步不重算 → skip（:1461-1464）
+    │
+    ├─ 3. 禁 chunk 模式(disable_chunked_mm_input)下窗口只能覆盖图的一部分
+    │      → num_new_tokens 砍到图起点之前，整个方法 break（:1469-1481）
+    │      ※ 因为 encoder 用双向注意力，一张图原则上要整块算
+    │
+    ├─ 4. can_allocate 失败（预算不够 / 缓存满且 freeable 也不够）
+    │      → num_computed 还没到图起点：砍 num_new_tokens 到图前（:1489-1494）
+    │      → num_computed 已越过图起点：num_new_tokens = 0（:1495-1500）
+    │      → break
+    │
+    ├─ 5. 算窗口与图区间的 embeds 重叠（:1505-1517）
+    │      本 chunk 内该图没有 embeds 落在窗口 → skip（允许 mm 分 chunk 时，
+    │      一张大图可能跨多步，只在覆盖到它的步里安排）
+    │
+    └─ 6. 分流（:1519-1530）
+           ├─ ec_connector.has_cache_item(identifier) → 进【返回值④】远端加载列表
+           └─ 否则 → 进【返回值①】本地编码列表，预算 -= embeds 数
+```
+
+### 五、实例演示
+
+设预算 `encoder_compute_budget = 300`：
+
+```
+请求序列（共 400 token）：
+  [文本 0~49] [图A 占位 50~149] [文本 150~199] [图B 占位 200~299] [文本 300~399]
+                ↓ 编码出 40 embeds                ↓ 编码出 280 embeds
+
+本步窗口：num_computed_tokens = 0, num_new_tokens = 400
+```
+
+**情形 1：预算充足、缓存空**
+
+- 图A：未命中缓存 → can_allocate(40 ≤ 300 ✓) → 进本地编码列表，预算 300−40=260；
+- 图B：can_allocate(280 > 260 ✗，freeable 也不足) → **失败** → `num_new_tokens` 砍到图B起点：`200 - 0 = 200` → break；
+- 返回：`([0], 200, 260, [])`——本步只算前 200 token（含图A 的编码），图B 留给下一步。
+
+**情形 2：图A 已在 encoder 缓存（同图的历史请求算过）**
+
+- 图A：`check_and_update_cache` → True，登记引用，skip（不耗预算、不进列表）；
+- 图B：预算 300 ≥ 280 → 进本地编码列表，预算剩 20；
+- 返回：`([1], 400, 20, [])`——图A 零成本复用，图B 本步编码。
+
+**情形 3：图B 在远端 EC 缓存（PD 分离场景 P 侧算过）**
+
+- 图A 正常本地安排；图B 走 `:1519-1525` → 进 `external_load_encoder_input`；
+- 返回：`([0], 400, 260, [1])`——图B 不耗本地算力（预算不扣 280），只占缓存坑位等 worker 拉取。
+
+### 六、一句话总结
+
+**输入**：请求的 mm 清单 + 本步调度窗口（左=已算数，右=计划算数）+ 全步共享的 encoder 算力预算 + EAGLE 位置偏移；**输出**：本步"本地要编码哪些图、远端要加载哪些图"两份清单 + 被 mm 约束裁剪后的 token 数 + 剩余预算。本质是**把"图必须先编码、decoder 才能读"这个因果约束，翻译成对 `num_new_tokens` 的裁剪和对两个共享资源（算力预算、缓存空间）的扣账**。
+
+---
+
+## Q&A：已命中的 encoder 缓存在 GPUModelRunner 中如何拉取
+
+> **原始问题：** 上面的回答中，已经命中的缓存，在 GPUModelRunner 中是如何拉取的呢？
+
+核心答案：**"命中"的拉取不在 scheduler，也不需要跨进程——它就在 GPUModelRunner 进程内一个普通字典 `self.encoder_cache: dict[str, torch.Tensor]`（`gpu_model_runner.py:572`）里，key 就是 mm_hash。** 每步 forward 前，runner 把"新算的"和"已命中的"统一进这个字典，再统一按 hash 取出来切片拼接。
+
+### 一、整体图景：每个 worker 一本"实物账"
+
+scheduler 侧的 `EncoderCacheManager` 只记**账本**（哪个 hash 有货、谁引用、谁该淘汰），embedding 张量实物始终放在 model runner 侧：
+
+```
+Scheduler 进程                          Worker 进程 (GPUModelRunner)
+┌─────────────────────┐                ┌──────────────────────────────┐
+│ EncoderCacheManager │                │ self.encoder_cache:          │
+│  cached: hash→请求集 │   账本指令      │   dict[mm_hash, Tensor]      │
+│  freeable / freed    │ ────────────▶  │   ★ embedding 实物在这里      │
+└─────────────────────┘  SchedulerOutput└──────────────────────────────┘
+        │                                        ▲            │
+        │ scheduled_encoder_inputs(要新算的)        │ 新算写入     │ 命中读取
+        │ free_encoder_mm_hashes(要删除的)          │            │
+        └────────────────────────────────────────┴────────────▼
+```
+
+### 二、逐步拆解：命中缓存的"拉取"过程
+
+每步 `_preprocess`（`gpu_model_runner.py:3563-3611`）按固定顺序做三件事：
+
+**第 1 步：先补货——`_execute_mm_encoder`（:3569）**
+
+只处理 scheduler 发来的 `scheduled_encoder_inputs`（即**未命中、需要本步新算**的图）：
+
+```python
+# :2998-3034  对清单里的每张图跑 vision encoder
+mm_hashes, mm_kwargs, _ = self._batch_mm_inputs_from_scheduler(scheduler_output)
+... encoder 前向 ...
+# :2986-2996  结果入字典
+self.encoder_cache[mm_hash] = output          # ← 新算的图写入缓存
+self.maybe_save_ec_to_connector(...)          #    同时存一份到 EC connector（若有）
+```
+
+**命中的图不在这个清单里，这里什么都不做**——这正是 scheduler 侧 `check_and_update_cache` 命中后 `continue` 的效果。
+
+**第 2 步：统一取货——`_gather_mm_embeddings`（:3570 → :3220-3334）**
+
+**命中与新算在此汇合**。对 batch 里每个请求、每个与本步窗口重叠的 mm 输入：
+
+```python
+mm_hash = mm_feature.identifier
+encoder_output = self._get_encoder_output_from_cache(mm_hash)   # :3273
+#   内部就是 return self.encoder_cache.get(mm_hash, None)        # :3218
+if encoder_output is None:
+    raise RuntimeError(f"Encoder cache miss for {mm_hash}.")     # :3283 兜底
+```
+
+**这就是"拉取"的全部**：一次 `dict.get(mm_hash)`。不需要 RPC、不需要锁——因为 scheduler 已经保证了不变量：*"凡是本步要用的图，要么上一步之前就在字典里（命中），要么第 1 步刚写进去（新算），要么 EC connector 已经加载进来（远端）"*。取不到 = scheduler 与 runner 状态不一致 = 直接报错。
+
+然后**切片**（:3285-3289）：
+
+```python
+mm_embeds_item = encoder_output[curr_embeds_start:curr_embeds_end]
+```
+
+注意即使命中也不是整张图全取：mm 允许分 chunk 跨步时，本步只取与窗口重叠的那段 embeds。
+
+同时构建 `is_mm_embed` 布尔掩码（:3293-3300），标记本步 token 序列里哪些位置要换成图的 embedding。
+
+**第 3 步：拼接进模型输入——`embed_input_ids`（:3600-3609）**
+
+```python
+inputs_embeds_scheduled = self.model.embed_input_ids(
+    self.input_ids.gpu[:num_scheduled_tokens],
+    multimodal_embeddings=mm_embeds,     # 第2步收集的图 embedding 列表
+    is_multimodal=is_mm_embed,           # 位置掩码
+)
+self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
+```
+
+文本 token 走正常 embedding 查表，掩码为 True 的位置用 `mm_embeds` 按顺序填入——**最终喂给模型 forward 的是拼接好的 `inputs_embeds`，而不是 token ids**。多模态模型因此统一走 embedding 输入路径（:3572-3574 的注释）。
+
+**配套：淘汰的执行——`_process_encoder_cache_scheduler_output`（:1177-1183, :1224）**
+
+scheduler 在 `can_allocate` 里淘汰的 `freed` 名单随 `SchedulerOutput.free_encoder_mm_hashes` 送达，runner 照单物理删除：
+
+```python
+for mm_hash in scheduler_output.free_encoder_mm_hashes:
+    self.encoder_cache.pop(mm_hash, None)     # 显存真正释放
+```
+
+### 三、完整时序图
+
+```
+一步 execute_model：
+│
+├─ SchedulerOutput 到达（含 scheduled_encoder_inputs / free_encoder_mm_hashes）
+│
+├─ ① _process_encoder_cache_scheduler_output      (:1224)
+│      pop(free_encoder_mm_hashes)  ← 先清淘汰项
+│
+├─ ② maybe_get_ec_connector_output(encoder_cache=self.encoder_cache)  (:3565)
+│   │    EC connector 上下文：远端命中的图在此加载进同一个字典
+│   │
+│   ├─ ③ _execute_mm_encoder                      (:3569)
+│   │      新图 → vision encoder → encoder_cache[mm_hash] = tensor
+│   │
+│   └─ ④ _gather_mm_embeddings                    (:3570)
+│          对每个重叠的 mm 输入（不分命中/新算/远端）：
+│            encoder_cache.get(mm_hash)  ★★★ "拉取"就发生在这里
+│            → 切片 [curr_embeds_start : curr_embeds_end]
+│            → 标记 is_mm_embed 掩码
+│
+├─ ⑤ embed_input_ids(input_ids, mm_embeds, is_mm_embed)   (:3600)
+│      文本查表 + 图 embedding 填位 → inputs_embeds.gpu
+│
+└─ ⑥ _model_forward(inputs_embeds=...)            (:4434)
+       模型前向，用的是拼接好的 embedding
+```
+
+### 四、要点提炼
+
+1. **"拉取"= 进程内字典查询 + 张量切片**（`:3218` + `:3287`），无任何跨进程传输；命中的全部收益（跳过 vision encoder）在 scheduler 决定"不排进 `scheduled_encoder_inputs`"时就已经兑现；
+2. **命中、新算、远端加载三路统一**：`_gather_mm_embeddings` 不区分来源，都从 `self.encoder_cache` 按 hash 取——scheduler 负责保证"取之前必有货"，这是两侧账本的契约，违反即 `RuntimeError`（`:3283`）；
+3. **写入侧三个入口**：`_execute_mm_encoder`（本地新算，`:2995`）、EC connector 远端加载（`:3565-3568` 上下文）、`prompt_embeds` 直通（`:3013-3028`）；删除侧一个出口：`free_encoder_mm_hashes`（`:1183`）——与 scheduler 的 `allocate/freed` 记账一一对应；
+4. **切片机制**使得"命中"也不必整图复用：mm 分 chunk 跨步时，每步只取窗口覆盖的那段 embeds。
