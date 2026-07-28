@@ -1,5 +1,56 @@
 # vLLM 中 `--max-model-len` 参数研究
 
+## 目录
+
+1. [参数入口与配置推导](#1-参数入口与配置推导)
+   - 1.1 [参数定义](#11-参数定义)
+   - 1.2 [`get_and_verify_max_len` 实现细节](#12-get_and_verify_max_len-实现细节)
+   - 1.3 [`derived_max_model_len_and_key` 的作用与含义](#13-derived_max_model_len_and_key-的作用与含义)
+   - 1.4 [Command-R / Cohere 系列特殊处理](#14-command-r--cohere-系列特殊处理)
+   - 1.5 [Sliding Window 限制](#15-sliding-window-限制)
+   - 1.6 [Tokenizer Config 限制](#16-tokenizer-config-限制)
+   - 1.7 [RoPE Scaling](#17-rope-scaling)
+   - 1.8 [Encoder Config 覆盖](#18-encoder-config-覆盖)
+   - 1.9 [用户指定值的优先级](#19-用户指定值的优先级)
+2. [GPU 内存管理与 `gpu-memory-utilization`](#2-gpu-内存管理与-gpu-memory-utilization)
+   - 2.1 [参数定义](#21-参数定义)
+   - 2.2 [正式生效位置](#22-正式生效位置)
+   - 2.3 [`MemorySnapshot` 底层实现](#23-memorysnapshot-底层实现)
+   - 2.4 [HBM 划分：两部分](#24-hbm-划分两部分)
+   - 2.5 [`determine_available_memory()` 详细实现](#25-determine_available_memory-详细实现)
+3. [KV Cache 空间分配流程](#3-kv-cache-空间分配流程)
+   - 3.1 [调用链路](#31-调用链路)
+   - 3.2 [`_auto_fit_max_model_len` 调用链路](#32-_auto_fit_max_model_len-调用链路)
+   - 3.3 [`max_model_len` 如何影响 KV cache 大小](#33-max_model_len-如何影响-kv-cache-大小)
+   - 3.4 [`num_blocks` 的含义](#34-num_blocks-的含义)
+   - 3.5 [KV cache 空间确定后还会改变吗？](#35-kv-cache-空间确定后还会改变吗)
+4. [KVCacheManager 的 Token 硬上限](#4-kvcachemanager-的-token-硬上限)
+   - 4.1 [实现位置](#41-实现位置)
+   - 4.2 [Scheduler 层的截断](#42-scheduler-层的截断)
+   - 4.3 [停止检查](#43-停止检查)
+   - 4.4 [作用](#44-作用)
+5. [输入层校验与默认 max_tokens](#5-输入层校验与默认-max_tokens)
+   - 5.1 [默认生成长度](#51-默认生成长度)
+   - 5.2 [Prompt 长度校验](#52-prompt-长度校验)
+6. [EncoderCacheManager 与 `max_model_len`](#6-encodercachemanager-与-max_model_len)
+   - 6.1 [`EncoderCacheManager` 初始化](#61-encodercachemanager-初始化)
+   - 6.2 [`cache_size` 的来源](#62-cache_size-的来源)
+   - 6.3 [是否与 `max_model_len` 有关？](#63-是否与-max_model_len-有关)
+   - 6.4 [`max_items_per_prompt` 参数解释](#64-max_items_per_prompt-参数解释)
+7. [完整流程图](#7-完整流程图)
+   - 7.1 [关键说明](#关键说明)
+8. [总结](#8-总结)
+9. [vLLM serve 启动参数示例](#9-vllm-serve-启动参数示例)
+   - 9.1 [`scheduler_config.max_num_encoder_input_tokens`](#91-scheduler_configmax_num_encoder_input_tokens)
+   - 9.2 [`scheduler_config.encoder_cache_size`](#92-scheduler_configencoder_cache_size)
+   - 9.3 [`max_tokens_per_mm_item`](#93-max_tokens_per_mm_item)
+   - 9.4 [完整示例命令](#94-完整示例命令)
+10. [`MultiModalBudget._get_max_items` 具体代码](#10-multimodalbudget_get_max_items-具体代码)
+    - 10.1 [代码解释](#101-代码解释)
+11. [总结](#11-总结)
+
+---
+
 ## 1. 参数入口与配置推导
 
 ### 1.1 参数定义

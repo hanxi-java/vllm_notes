@@ -27,6 +27,7 @@
 - [Q9：从 preprocess 产生的 pixel_values 到被 ViT 消费，中间的链路？](#q9从-preprocess-产生的-pixel_values-到被-vit-消费中间的链路)
 - [Q10：带图片请求的推理整体流程、参与对象与关键方法（总览）](#q10带图片请求的推理整体流程参与对象与关键方法总览)
 - [Q11：Qwen3VLModel.get_image_features 方法详解](#q11qwen3vlmodelget_image_features-方法详解)
+- [Q12：Qwen3VLVisionModel / Qwen3VLTextModel / Qwen3VLModel 的区别](#q12qwen3vlvisionmodel--qwen3vltextmodel--qwen3vlmodel-的区别)
 
 ---
 
@@ -978,3 +979,74 @@ split 是为 API 契约做的，cat 是内部链路的成本（一次拼接，�
 ```
 
 **一句话**：`get_image_features` 是视觉塔的"外交接口"——对内负责 dtype 对齐和调塔，对外把打包序列按图切分，同时保留 deepstack 中间层特征，供模型 forward 或外部调用者按需取用。
+
+---
+
+## Q12：Qwen3VLVisionModel / Qwen3VLTextModel / Qwen3VLModel 的区别
+
+三个类是 Qwen3-VL 的**三层俄罗斯套娃**——从外到内每层包装一层，职责完全正交。都在 `modeling_qwen3_vl.py` 里。
+
+### 一句话区分
+
+| 类 | 行号 | 一句话定位 | 输入 → 输出 |
+|---|---|---|---|
+| `Qwen3VLVisionModel` | :612 | **视觉塔**：只管看图 | `pixel_values + grid_thw` → 视觉 token 特征 |
+| `Qwen3VLTextModel` | :745 | **语言模型**：只管读写文字 | `inputs_embeds + position_ids` → 文本 hidden states |
+| `Qwen3VLModel` | :865 | **融合层**：把图"翻译"成文，再交给语言模型 | 原始多模态输入 → 融合后的 hidden states |
+
+### 1. Qwen3VLVisionModel —— 视觉编码器（:612-736）
+
+- **看见什么**：只认识 `pixel_values (Σpatch, 1176)` 和 `grid_thw (n,3)`，**完全不认识 token、文本、词表**；
+- **内部组成**：`patch_embed`（Conv3d）→ `pos_embed`（可学习绝对位置）+ `rotary_pos_emb`（2D RoPE）→ `blocks ×N`（**双向**注意力，`is_causal=False`）→ `merger` + `deepstack_merger_list`；
+- **输出**：`BaseModelOutputWithDeepstackFeatures`（merge 后特征 + 中间层特征）；
+- **类比**：眼睛 + 视觉皮层。把像素转成"语义特征"，但自己不会说话。
+
+### 2. Qwen3VLTextModel —— 文本解码器（:745-861）
+
+- **看见什么**：只认识 embedding 序列和位置 id，**不知道哪些向量来自图像**——视觉 token 对它只是"一串普通的输入向量"；
+- **内部组成**：`embed_tokens` → `layers ×N`（**因果**注意力）→ `norm`，外加两个多模态钩子：
+  - `position_ids (4, B, L)` 拆包，MRoPE 三轴施加到 q/k（:807-824）；
+  - `_deepstack_process`：前几层把视觉中间特征加到视觉位置（:853-861）；
+- **输出**：`BaseModelOutputWithPast`（hidden states + KV cache）；
+- **类比**：大脑语言中枢。收到的是"已经翻译好的"信息，不需要知道信息来自眼睛还是耳朵；
+- **配置独立**：有自己的 `Qwen3VLTextConfig`，可单独实例化（注释写明 "not a pure text-only model"，就是因为 deepstack 钩子）。
+
+### 3. Qwen3VLModel —— 多模态融合器（:865-1258）
+
+上面两者的**粘合层 + 翻译官**，本身几乎没有计算层，全是编排逻辑：
+
+1. 持有 `self.visual` 和 `self.language_model` 两个子模块（:872-873，均用 `AutoModel.from_config` 构建，体现解耦）；
+2. `get_image_features` / `get_video_features`：调视觉塔并按图切分（见 Q11）；
+3. `get_placeholder_mask` + `masked_scatter`：视觉特征灌进文本 embedding 序列（:1068, :1199）——**"翻译"发生在这里**：图像从像素空间进入文本 embedding 空间；
+4. `compute_3d_position_ids` / `get_rope_index`：为混合序列计算 MRoPE 位置（:931, :1109）；
+5. 组装 `visual_pos_masks` + `deepstack_visual_embeds`，传给文本模型（:1213-1246）。
+
+**类比**：大脑的联合皮层——接收眼睛的信号，转换成语言中枢能处理的格式，并告诉它"第 5-1012 号位置的信息来自一张 72×56 网格的图"。
+
+### 关键区别维度
+
+| 维度 | VisionModel | TextModel | VLModel |
+|---|---|---|---|
+| 注意力类型 | 双向（图内） | 因果 | 不自己做注意力 |
+| 位置编码 | 2D RoPE（h,w） | **3D MRoPE**（t,h,w） | 计算 MRoPE 的 position_ids |
+| 是否接触 pixel_values | ✅ 唯一直接消费者 | ❌ | 只做转发，不计算 |
+| 是否接触 input_ids/词表 | ❌ | ✅ | ✅（但只为查 embedding 和找占位符） |
+| 是否有新参数 | 全部视觉参数 | 全部文本参数 | **几乎没有**（纯编排） |
+| 可独立使用 | ✅ 图像编码器 | ✅ 可当纯文本 LLM | 多模态时才需要 |
+
+### 套娃关系全景（含最外层）
+
+```
+Qwen3VLForConditionalGeneration        ← 生成接口：lm_head + generate() + loss
+   └─ Qwen3VLModel                     ← 融合：masked_scatter + MRoPE + DeepStack 组装
+       ├─ Qwen3VLVisionModel (visual)  ← 看图：pixel_values → 视觉 token
+       └─ Qwen3VLTextModel (language)  ← 读写：embeds → hidden states
+```
+
+### 为什么这样拆
+
+1. **图/视频/文本复用**：VisionModel 同时服务图像和视频入口；TextModel 理论上可独立加载为纯文本模型；
+2. **组合式配置**：`Qwen3VLConfig` 内含 `vision_config` + `text_config` 两个子配置，两个子模型各自用 `AutoModel.from_config` 构建（:872-873），视觉塔换架构不用动文本侧；
+3. **vLLM 移植友好**：vLLM 侧对应拆成 `Qwen3VLVisionTransformer` 和 `Qwen3LLMModel`，融合逻辑（scatter、MRoPE）重写在 vLLM 的 model 类里——三方职责一一对应。
+
+**一句话总结**：VisionModel 管"看"，TextModel 管"说"，VLModel 管"把看到的变成能说的"——三者通过 `(pixel_values, grid_thw)` 和 `(inputs_embeds, position_ids)` 两份标准化接口通信，互不越界。
