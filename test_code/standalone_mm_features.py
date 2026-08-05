@@ -19,7 +19,7 @@ from PIL import Image
 from vllm.config import ModelConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"  # 或本地模型路径
+MODEL_ID = "/home/w00958735/Qwen3-VL-8B-Instruct"  # 或本地模型路径
 IMAGE_PATH = "test.jpg"
 
 
