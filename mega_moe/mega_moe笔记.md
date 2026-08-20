@@ -21,6 +21,8 @@
 17. [问题十七：NPUModelRunner 三个新增字段的含义与作用](#问题十七npumodelrunner-三个新增字段的含义与作用)
 18. [问题十八：should_skip_allreduce_across_dp_group 为 true 的条件](#问题十八should_skip_allreduce_across_dp_group-为-true-的条件)
 19. [问题十九：MXFP 量化场景约束解读](#问题十九mxfp-量化场景约束解读)
+20. [问题二十：Qwen3.6-35B-A3B 与 DeepSeek 的单个专家执行流程对比](#问题二十qwen3635b-a3b-与-deepseek-的单个专家执行流程对比)
+21. [问题二十一：gate/up 是否共用一份权重（l1_weights）](#问题二十一gateup-是否共用一份权重l1_weights)
 
 ---
 
@@ -3445,3 +3447,297 @@ A4W4-FP : BF16 → MXFP4 E2M1 → A4W4 GMM1 → MXFP8 E4M3 → A8W4 GMM2 → BF1
 ### 一句话总结
 
 MXFP 是 Ascend 950 上基于 **MX（微缩放，group size=32 + 共享 E8M0 scale）** 的浮点量化，分 A8W8-FP / A8W4-FP / A4W4-FP 三档。其「场景约束」的核心是：权重/激活 dtype 必须按场景严格配套（dispatch 量化类型与权重类型绑定）、权重 scale 是**四维 [E, out, ⌈in/64⌉, 2]**（逐通道 × 每 64 元素内 2 个 32 元素 MX block 的 E8M0 scale）、W1 中间维是 W2 的 2 倍（SwiGLU 减半）、4bit 权重需 FRACTAL_NZ_C0_32 布局、且不支持 x_active_mask/scales 输入。
+
+---
+
+## 问题二十：Qwen3.6-35B-A3B 与 DeepSeek 的单个专家执行流程对比
+
+**原问题：**
+
+> 你在问题十三的"单个专家的执行流程"部分，给出了 DeepSeek 专家 FFN 的执行流程。对于 Qwen3.6-35B-A3B 模型，其执行流程也是这样的吗？如果不是，也请画出来。
+
+**回答：**
+
+**直接结论：单个（routed）专家的 FFN 执行流程和 DeepSeek 完全一样，是同一个 SwiGLU 结构。** 但如果把视角从"单个专家"放大到"整个 MoE 层 / 层结构"，Qwen3.6-35B-A3B 和 DeepSeek 的差异就出来了——多了一个带 sigmoid 门控的 **shared expert（共享专家）**，而且它是**混合架构（hybrid）**，并非每一层都是 MoE 层。下面分两层讲。
+
+### 一、单个专家的 FFN：结构与 DeepSeek 完全相同
+
+Qwen3.6-35B-A3B 属于 Qwen3Next 家族，代码落在 `vllm/vllm/model_executor/models/qwen3_next.py`。它的专家 MLP 直接从 qwen2_moe 借来：
+
+```python
+# qwen3_next.py:51
+from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
+```
+
+`Qwen2MoeMLP`（`qwen2_moe.py:73-118`）的三个组件，与问题十三里 DeepSeek 专家 FFN（`deepseek_v2.py:323-339`）**一一对应**：
+
+| 组件 | DeepSeek 专家（问题十三） | Qwen3Next 专家（Qwen2MoeMLP） | 是否相同 |
+|---|---|---|---|
+| 上投影 | `gate_up_proj` = MergedColumnParallelLinear(hidden, [intermediate]×2) | `qwen2_moe.py:86` 同款 | ✅ 相同 |
+| 激活 | `act_fn` = `SiluAndMul()`（SwiGLU） | `qwen2_moe.py:107` `SiluAndMul()` | ✅ 相同 |
+| 下投影 | `down_proj` = RowParallelLinear(intermediate, hidden) | `qwen2_moe.py:94` 同款 | ✅ 相同 |
+
+激活函数也都是 silu：`Qwen2MoeMLP` 里写死只支持 silu（`qwen2_moe.py:103-106`，非 silu 直接 `raise ValueError`），`qwen3_next` 的 config 默认 `hidden_act="silu"`（`qwen3_next.py:194`）。所以"上投影 → SwiGLU → 下投影"这条链一模一样，问题十三那张单个专家流程图对 Qwen3.6-35B-A3B 的 routed 专家**原样适用**：
+
+```
+        hidden_states [T, H]
+                │
+                ▼
+     ┌──────────────────────────┐
+     │  gate_up_proj（w1 上投影）│  [T, H] → [T, 2I]
+     └──────────────────────────┘
+                │  ← 中间切开
+       ┌────────┴────────┐
+       ▼                 ▼
+    gate [T, I]         up [T, I]
+       │                 │
+       ▼                 │
+   SiLU(gate)            │
+       │                 │
+       └────────┬────────┘
+                ▼
+        SiLU(gate) × up   [T, I]      （SwiGLU）
+                │
+                ▼
+     ┌──────────────────────────┐
+     │  down_proj（w2 下投影）   │  [T, I] → [T, H]
+     └──────────────────────────┘
+                │
+                ▼
+            output [T, H]
+```
+
+`qwen3_next.py` 的权重映射也印证了这一点：`gate_proj`/`up_proj` 被合并成 `gate_up_proj`（`qwen3_next.py:551-552`），和 DeepSeek 的打包方式一致。
+
+### 二、差异在"MoE 层"这一级：多了一个带 sigmoid 门控的 shared expert
+
+单个专家一样，但 Qwen3.6-35B-A3B 的 `Qwen3NextSparseMoeBlock`（`qwen3_next.py:93-208`）比问题十三描述的多一个 **shared expert**，且它有一个**专门的标量门控**：
+
+```python
+# qwen3_next.py:124-138
+self.gate = ReplicatedLinear(hidden, num_experts)          # 路由专家 router
+self.shared_expert_gate = ReplicatedLinear(hidden, 1)      # 共享专家的标量门控（输出 1 维）
+
+# qwen3_next.py:154-163
+self.shared_expert = Qwen3NextMLP(
+    intermediate_size=config.shared_expert_intermediate_size,
+    expert_gate=self.shared_expert_gate,   # ← 把门控传进去
+    ...
+)
+```
+
+关键在 `Qwen2MoeMLP.forward`（`qwen2_moe.py:110-118`）：
+
+```python
+def forward(self, x):
+    gate_up, _ = self.gate_up_proj(x)
+    out = self.act_fn(gate_up)            # SwiGLU
+    out, _ = self.down_proj(out)
+    if self.expert_gate is not None:      # ← shared expert 专属
+        out = F.sigmoid(self.expert_gate(x)[0]) * out
+    return out
+```
+
+也就是说，shared expert 的输出 = `sigmoid(shared_expert_gate(x)) × SwiGLU_FFN(x)`。它**不经过路由**（对所有 token 都算），用一个**逐 token 的标量 sigmoid 门**来调制，最后加回到 routed 专家的输出上。
+
+#### Qwen3.6-35B-A3B 完整 MoE 层流程图（对比问题十三）
+
+```
+                     hidden_states [T, H]
+                            │
+              ┌─────────────┴──────────────────┐
+              ▼                                ▼
+   ┌────────────────────┐          ┌────────────────────────┐
+   │  gate（路由）        │          │  shared_expert_gate     │  ReplicatedLinear
+   │  ReplicatedLinear   │          │  [T, H] → [T, 1]        │  (hidden → 1)
+   │  [T, H] → [T, E]    │          └────────────────────────┘
+   └────────────────────┘                       │
+              │  topk 选专家                    ▼
+              ▼                           sigmoid(...) [T, 1]   ← 逐 token 标量门
+   ┌────────────────────────┐                       │
+   │  Dispatch（EP all-to-all）│                       │
+   └────────────────────────┘                       │
+              │                                    │
+              ▼                                    ▼
+   ┌──────────────────────────────────┐  ┌──────────────────────────────┐
+   │  每个 routed expert 做 FFN        │  │  shared expert 做 FFN         │
+   │  w1 → SwiGLU → w2（与 DeepSeek 同）│  │  w1 → SwiGLU → w2             │
+   │  expert0, expert1, ...           │  │  然后 × sigmoid(gate(x))       │
+   └──────────────────────────────────┘  └──────────────────────────────┘
+              │                                    │
+              ▼                                    │
+   ┌────────────────────────┐                       │
+   │  Combine（all-to-all 回传）│                       │
+   │  按 topk_weights 加权求和 │                       │
+   └────────────────────────┘                       │
+              │                                    │
+              └────────────────┬───────────────────┘
+                               ▼
+               final = routed_out + shared_out   [T, H]
+```
+
+（vllm-ascend 文档里那句 `multistream_overlap_shared_expert` —— "overlaps shared expert computation" —— 正是针对这个 shared expert 的优化，进一步印证它确实存在。见 `vllm-ascend/docs/source/tutorials/models/Qwen3.6-35B-A3B.md`。）
+
+### 三、还有一个层面：它是混合架构，不是每层都是 MoE
+
+DeepSeek 是"每层都是 MoE（或 dense）"的纯 Transformer；Qwen3.6-35B-A3B 是 **hybrid**，层类型由 `layer_types` + `decoder_sparse_step` 决定（`qwen3_next.py:400-406`）：
+
+```python
+is_moe_layer = (self.layer_idx not in mlp_only_layers) and (
+    config.num_experts > 0 and (self.layer_idx + 1) % config.decoder_sparse_step == 0
+)
+```
+
+- `layer_types` 里是 `"linear_attention"`（Gated DeltaNet 线性注意力）和 `"full_attention"` 交替（`qwen3_next.py:250-254` 默认每 4 层一个 full attention）。
+- 只有满足 `(layer_idx+1) % decoder_sparse_step == 0` 的层才是 MoE（`Qwen3NextSparseMoeBlock`），其余层是 dense MLP（`qwen3_next.py:437-443`，也还是 SwiGLU 结构）。
+
+这一点不影响"单个专家"的结论，但影响对整个模型执行流程的理解。
+
+### 四、总结对比表
+
+| 维度 | DeepSeek（问题十三） | Qwen3.6-35B-A3B（Qwen3Next） |
+|---|---|---|
+| 单个 routed 专家 FFN | `gate_up → SwiGLU → down` | **完全相同**（`Qwen2MoeMLP`） |
+| 激活函数 | SiLU（SwiGLU） | SiLU（`hidden_act="silu"`，只支持 silu） |
+| shared expert | 有（问题十三未展开） | **有，且带 `sigmoid(shared_expert_gate(x))` 逐 token 门控** |
+| 每层都是 MoE？ | 是（MoE 密集堆叠） | **否，hybrid**：linear/full attention + 稀疏 MoE + dense MLP 混合 |
+
+### 一句话总结
+
+**单个专家执行流程不用改——它和 DeepSeek 一样是 SwiGLU。** 要画的是"单个专家"之外的完整 MoE 层，那么 Qwen3.6-35B-A3B 多出来的就是那个"带 sigmoid 门控、全 token 共享"的 shared expert，以及 hybrid 的层结构。
+
+---
+
+## 问题二十一：gate/up 是否共用一份权重（l1_weights）
+
+**原问题：**
+
+> 问题十三提到了 SwiGLU 需要两个分量——gate（门）和 up（上），他们是共用一份权重的吗？也就是 `C:\Code\cann\ops-transformer\torch_extension\cann_ops_transformer\docs\zh\mega_moe.md` 文件中调用示例的 Ascend 950PR/Ascend 950DT MXFP 量化场景约束表格的 `l1_weights` 列对应的权重吗？
+
+**回答：**
+
+**是的，gate（门）和 up（上）在 mega_moe 算子里对应同一份权重 `l1_weights`（即 W1 / 上投影权重）。** 更准确地说：它们是**拼接在同一张权重矩阵里**——`l1_weights` 的形状里那个 `2 × intermediate_hidden` 的 "2×"，就是 gate 和 up 两份参数被合并成一个张量的结果。算子内部再把它"从中间切开"成两半：前半是 gate、后半是 up。
+
+但要纠正一个可能的误解：**"共用一份权重" ≠ "gate 和 up 用同一份完全相同的数值"**。它们用的是**同一个张量 `l1_weights` 里互不重叠的两半**（gate 用前 `intermediate_hidden` 列，up 用后 `intermediate_hidden` 列）。
+
+### 一、mega_moe 文档的直接证据
+
+文档 `mega_moe.md` 里写得很清楚，三处可以互相印证：
+
+#### 证据 1：`l1_weights` 的参数描述直接写了"包括门控与上投影"
+
+`mega_moe.md:784`（参数表）：
+
+> `l1_weights`：MoE专家网络**第一线性层的权重矩阵（包括门控与上投影）**，用于将输入映射至中间维度，输出供给激活函数。
+
+形状（`mega_moe.md:787`，非量化场景）：
+
+```
+(hidden, 2 × intermediate_hidden)
+        ↑
+      这个 "2×" = gate + up 两部分
+```
+
+MXFP（950）场景的形状（`mega_moe.md:802/807/812`）：
+
+```
+(num_experts_per_rank, 2 × intermediate_hidden, hidden)
+```
+
+#### 证据 2：公式里 W1 直接就是 gate/up 的合并
+
+`mega_moe.md:38`：
+
+```
+W1^moe ∈ R^{local_moe_expert_num × hidden × (2·intermediate_hidden)}
+    ：路由 MoE 专家的 Linear1 权重，对应入参 l1_weights 的 MoE 专家部分。
+```
+
+#### 证据 3：计算说明里明确"切两半"
+
+`mega_moe.md:128-135`（A16W16 场景）：
+
+```
+Linear1 投影是专家网络的第一层线性变换，同时产生 gate部分 和 up部分 所需的预激活值：
+    H_e = X_e · W1[e]          ∈ R^{N_e × 2·intermediate_hidden}
+
+将 H_e 沿列维度拆分为 gate 分支 G_e 和 up 分支 U_e ...
+```
+
+MXFP 场景写得更直白（`mega_moe.md:444-458`）：
+
+```
+G_e = DQ(X) · W1,e^(G),    U_e = DQ(X) · W1,e^(U)
+
+说明：将 W1 的前 N/2 列 W1,e^(G) 和后 N/2 列 W1,e^(U) 分别...
+    得到 gate 分支 G_e 和 up 分支 U_e
+```
+
+所以：**一份 `l1_weights`，前 `N/2` 列是 gate，后 `N/2` 列是 up，做完同一个矩阵乘后再切开做 SwiGLU。**
+
+### 二、和 vllm 里的 `gate_up_proj` 是同一个东西
+
+这正好对应问题十三里 DeepSeek 专家的：
+
+```python
+self.gate_up_proj = MergedColumnParallelLinear(
+    hidden_size,
+    [intermediate_size] * 2,     # ← 输出两倍：gate + up 各一半
+)
+```
+
+`MergedColumnParallelLinear` 就是把 `gate_proj` 和 `up_proj` **合并成一个线性层**，它的权重就是 `[gate_proj.weight; up_proj.weight]` 沿输出维拼接。传进 mega_moe 算子时，这个合并后的权重就是 `l1_weights`：
+
+```python
+# moe_comm_method.py:349
+weight1 = to_list(fused_experts_input.weights.w1)   # ← w1 即 l1_weights
+
+# moe_comm_method.py:389-404
+self.mega_moe(..., weight1, weight2, ...)           # 位置参数 l1_weights, l2_weights
+```
+
+而且 vllm 侧的变量命名也印证了这一点——量化方法里管它叫 `w13_weight`（`w8a8_dynamic.py:247/255`），其中 **w1 = gate、w3 = up，合并后叫 w13**：
+
+```python
+# w8a8_dynamic.py:247
+param_dict["w13_weight"] = torch.empty(...)   # w1(gate)+w3(up) 合并
+```
+
+另外 Qwen3Next 的权重映射（`qwen3_next.py:551-552`）也说明了合并关系：
+
+```python
+".mlp.gate_proj": (".mlp.gate_up_proj", 0),   # gate 是合并后第 0 半
+".mlp.up_proj":   (".mlp.gate_up_proj", 1),   # up   是合并后第 1 半
+```
+
+### 三、完整对应关系图
+
+```
+检查点（HF，两个独立权重）          vllm 层（合并成一个）            mega_moe 算子
+─────────────────────────────    ─────────────────────────    ─────────────────────
+gate_proj.weight [I, H]   ┐
+                          ├─► gate_up_proj.weight [2I, H]  ──►  l1_weights (W1)
+up_proj.weight   [I, H]   ┘     （MergedColumnParallelLinear）    shape (hidden, 2I)
+                                                                    │
+                                                          Linear1: H = X·W1
+                                                                    │
+                                              沿列切成两半（前 I 列 / 后 I 列）
+                                                                    │
+                                              ┌───────────┴───────────┐
+                                              ▼                       ▼
+                                          gate G_e                 up U_e
+                                              └───────────┬───────────┘
+                                                          ▼
+                                              SwiGLU: SiLU(G) ⊙ U    (维度回到 I)
+                                                          │
+                                                          ▼
+                                                  l2_weights (W2)      shape (hidden, I)
+```
+
+（`I = intermediate_hidden`，`H = hidden`。注意 l1 的中间维是 `2I`，l2 的中间维是 `I`——SwiGLU 把 `2I` 减半成 `I`，这正是问题十九里那句"W1 中间维是 W2 的 2 倍（SwiGLU 减半）"。）
+
+### 四、一句话总结
+
+- **是同一份权重**：gate 和 up 由同一个 `l1_weights`（W1 = 上投影）产生，这个张量的中间维是 `2 × intermediate_hidden`，就是 gate 和 up 两半拼接而成。
+- 但**不是数值相同**：它们是"拼在一张 tensor 里的两半"——前 `N/2` 列算 gate，后 `N/2` 列算 up，各用各的、互不重叠。
+- 这条链完整对应 vllm 里的 `gate_up_proj`（`MergedColumnParallelLinear`）→ `w13_weight` → mega_moe 的 `l1_weights`。
