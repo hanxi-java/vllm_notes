@@ -3741,3 +3741,100 @@ up_proj.weight   [I, H]   ┘     （MergedColumnParallelLinear）    shape (hid
 - **是同一份权重**：gate 和 up 由同一个 `l1_weights`（W1 = 上投影）产生，这个张量的中间维是 `2 × intermediate_hidden`，就是 gate 和 up 两半拼接而成。
 - 但**不是数值相同**：它们是"拼在一张 tensor 里的两半"——前 `N/2` 列算 gate，后 `N/2` 列算 up，各用各的、互不重叠。
 - 这条链完整对应 vllm 里的 `gate_up_proj`（`MergedColumnParallelLinear`）→ `w13_weight` → mega_moe 的 `l1_weights`。
+
+---
+
+**原问题二：**
+
+> gate（门）和 up（上）拼接在同一张权重矩阵（`l1_weights`）里，这样设计的目的是什么？为了内存连续吗？
+
+**回答二：**
+
+**内存连续只是"副产品"，不是主要目的。核心目的是把两次 GEMM 合并成一次 GEMM**——因为 gate 和 up 共享同一个输入 x，合并后 `x @ W_gate` 和 `x @ W_up` 可以写成一次 `x @ [W_gate; W_up]`，从而省一次 kernel launch、让 x 只读一次、并让 GEMM 的 N 维度翻倍（效率更高）。
+
+### 1. 核心原因：一次 GEMM 代替两次（性能）
+
+gate 和 up 有一个关键共性：**它们的输入完全相同（都是 hidden_states x），只是输出维度不同**。这决定了它们天然适合合并。
+
+vllm 的 `MergedColumnParallelLinear`（`linear.py:645-701`）就是干这个的：
+
+```python
+# linear.py:646-650
+"""... the weight matrix is concatenated along the output dimension."""
+
+# linear.py:689-692
+super().__init__(
+    input_size=input_size,
+    output_size=sum(output_sizes),   # ← [I] + [I] = 2I，合并成一张权重
+    ...
+)
+```
+
+合并前后的对比：
+
+```
+合并前（两次 GEMM）:
+    G = x @ W_gate      # [T, H] @ [H, I]   → [T, I]
+    U = x @ W_up        # [T, H] @ [H, I]   → [T, I]
+    ↑ x 读了两次、launch 两次、两次都只有 [I] 的窄 GEMM
+
+合并后（一次 GEMM）:
+    [G | U] = x @ [W_gate; W_up]   # [T, H] @ [H, 2I] → [T, 2I]
+    ↑ x 只读一次、launch 一次、N=2I 更宽
+```
+
+带来的收益：
+
+1. **减少 kernel launch**：2 → 1 次。MoE 里专家多、token 小，launch 开销占比很高。
+2. **x 只读一次**：减少从 HBM 读激活的访存量（gate 和 up 都要读同一份 x，合并后省一半）。
+3. **GEMM 的 N 维度翻倍**：更大的矩阵乘有更高的算术强度（compute/memory 比），tensor core 利用率更好。窄 GEMM（如 N=I 只有几千）往往访存/launch 瓶颈，翻倍后更接近算力瓶颈。
+
+这跟 QKV 合并成一个 `qkv_proj`（`MergedColumnParallelLinear` 同样用于 attention 的 q/k/v）是**完全同一套思路**。
+
+### 2. 配合 SwiGLU 的融合算子（silu_and_mul）
+
+合并后，gate 和 up 的输出在内存里**天然相邻**——是同一个 `[T, 2I]` tensor 的前半/后半。所以：
+
+- "从中间切开"是**零拷贝的 slice/view**（不是真的复制）；
+- 可以用一个 `silu_and_mul` 融合算子，把"切两半 + SiLU(gate) + 逐元素乘 up"三步一次做完。
+
+这正是 vllm 里 `MoEActivation.SILU → "silu_and_mul"`（`activation.py:86`）的由来，也是 mega_moe 里 SwiGLU 能作为单个激活步骤存在的前提（`mega_moe.md:55-68` 的激活公式）。
+
+如果 gate/up 是两个独立 tensor，`SiLU(gate) × up` 就得先各自算完再跨 tensor 相乘，无法做就地融合。
+
+### 3. 量化/布局转换只需做一次（这个才跟"内存/格式"更相关）
+
+在量化场景（尤其 mega_moe 的 int8/int4/FRACTAL_NZ，或 MXFP 的 E8M0 scale）下，合并成一张 `[2I, H]` 矩阵意味着：
+
+- **量化一次**：权重转 int8/int4、算 scale/offset，只需对一张矩阵做，而不是对 gate/up 两张分别做；
+- **布局转换一次**：转 FRACTAL_NZ、FRACTAL_NZ_C0_32 只需一次；
+- **TP 分片一致**：gate 和 up 一起做 column-parallel 切分，保证两者用同一套 tp_size 和分片，不会出现 gate/up 分片不一致的问题（`routed_experts.py:486` 注释 "gate_up_proj: MergedColumnParallel, so tp sharding on output_dim"）。
+
+对 mega_moe 这种要求"每个专家一个 FRACTAL_NZ tensor 的 list"的算子（`moe_comm_method.py:351-356`），合并后 `l1_weights` 恰好就是这一个完整 tensor，scale 也统一成 `l1_weights_sf` 一个参数。
+
+### 4. 算子接口简洁
+
+mega_moe 是 Dispatch + Linear1 + SwiGLU + Linear2 + Combine 的融合算子，它要一次性拿到完整的 W1。合并成 `l1_weights` 一个参数（而不是 `l1_gate_weights` + `l1_up_weights` 两个），接口更简单，scale 也只需 `l1_weights_sf` 一个配套。
+
+vllm 侧的命名直接点破了这个合并：**w1 = gate，w3 = up，合并后叫 w13**（`layer.py:149`、`config.py:1391` "Number of shards fused into w13: gate and up for gated"、`routed_experts.py:918` "w1 and w3 share one fused tensor"）。
+
+### 5. 你猜的"内存连续"——是好处，但不是主因
+
+合并成一个连续 tensor 确实带来内存布局上的好处（权重连续、利于 cache 命中、利于 DMA/搬运、利于 `torch.cat` 加载），但这是**附带收益**，不是设计动机。因为：
+
+- 如果只是为了让内存连续，那么"把 gate/up 相邻存放"就够了，不需要非要用 `MergedColumnParallelLinear` 这种"合并成一次 GEMM"的方式；
+- 真正的收益来自**计算侧**（一次 GEMM + 融合激活），内存连续只是让这一张 `[2I, H]` 矩阵在量化/搬运时更省事。
+
+### 总结对比表
+
+| 目的 | 是不是主因 | 说明 |
+|---|---|---|
+| 一次 GEMM 代替两次 | ✅ **核心** | gate/up 共享输入 x，合并后省 launch、省访存、N 翻倍 |
+| 配合 silu_and_mul 融合 | ✅ 重要 | 合并后切两半零拷贝，激活可融合就地算 |
+| 量化/布局/TP 只做一次 | ✅ 重要 | 一张矩阵量化一次、转 FRACTAL_NZ 一次、分片一致 |
+| 算子接口简洁 | ◽ 次要 | `l1_weights` 一个参数 + 一个 `l1_weights_sf` |
+| 内存连续 | ◽ **附带** | 有好处，但不是设计动机 |
+
+### 一句话总结
+
+**把 gate/up 拼进同一份 `l1_weights`（gate_up_proj/w13），核心目的是"两次矩阵乘 → 一次矩阵乘"**：因为两者输入相同，合并后省一次 kernel launch、x 只读一次、N 维度翻倍提升 GEMM 效率，并能配合 `silu_and_mul` 融合激活、让量化/FRACTAL_NZ/TP 分片只做一次。内存连续只是这套合并方案的"顺带好处"，不是主要动机。
