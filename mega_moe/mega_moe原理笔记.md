@@ -27,6 +27,7 @@
 17. [专题：阶段④ GMM1 + SwiGLU + 再量化 详解](#15-专题阶段-gmm1--swiglu--再量化-详解)
 18. [专题：阶段⑤ GMM2 + Combine 详解](#16-专题阶段-gmm2--combine-详解)
 19. [专题：阶段⑥ Unpermute 详解](#17-专题阶段-unpermute-详解)
+20. [专题：阶段① 本卡输入 MX 量化详解（A4W4-FP）](#18-专题阶段-本卡输入-mx-量化详解a4w4-fp)
 
 ---
 
@@ -2994,3 +2995,259 @@ combineSend 区里 token t 占了 10 行（行号 = t*10 + 0..9），
 5. **只在 AIV 上跑**：反量化 + 乘加是纯向量运算，Cube 核此时已退出。
 
 至此六个阶段（① 本卡量化 → ② mask 广播 → ③ Dispatch → ④ GMM1+SwiGLU+再量化 → ⑤ GMM2+Combine → ⑥ Unpermute）全部串完——一个 token 从 BF16 输入，绕一圈 Dispatch/Combine，最终以 BF16 输出回到原地，中间所有结果都不出 kernel、不落回 Python。
+
+---
+
+## 18. 专题：阶段① 本卡输入 MX 量化详解（A4W4-FP）
+
+**原问题：**
+
+> A5 阶段① 本卡输入 MX 量化，对于 A4W4-FP 场景，具体是使用了什么方法进行的量化？
+
+**回答：**
+
+**一句话结论**：A4W4-FP 场景的阶段① 用的是 **MXFP4 量化（Microscaling FP4）**——把本卡 BF16 输入按 **group=32** 分组，每组提取一个 **E8M0 共享指数 scale**，把组内元素缩放到 FP4 表示范围，再 cast 成 **FP4 E2M1**（4-bit 浮点：1 符号 + 2 指数 + 1 尾数），**2 个元素打包进 1 字节**。它与 FP8 量化是同一套「三步走」，唯一区别是目标类型换成 `fp4x2_e2m1_t`。
+
+### 18.1 先定位：A4W4-FP 的完整数据流
+
+```text
+A4W4-FP: BF16 → MXFP4(E2M1) → A4W4 GMM1 → MXFP8(E4M3) → A8W4 GMM2 → BF16
+                  ↑ 阶段① 这里量化成 FP4 E2M1
+```
+
+关键：**FP4 只用在「输入激活」（GMM1 的 A）**。因为权重 W1 也是 FP4 E2M1，要算 FP4×FP4（A4W4），激活必须配成 FP4。而 GMM1 之后 SwiGLU 输出会**再量化成 FP8 E4M3**（不是 FP4），因为 GMM2 是 A8W4——这正是「避免两段都用 FP4 精度损失过大」的设计。
+
+### 18.2 量化入口：`QuantizeTokenInUb` 的 E2M1 分支
+
+`mega_moe_token_quant.h:92-116`：
+
+```cpp
+Quant::ComputeMaxExp(srcAddr, maxExpAddr, hiddenDim);     // ① 求每组最大指数
+Quant::ComputeScale<QuantOutType>(maxExpAddr, mxScaleAddr, halfScaleAddr, ...);  // ② 生成 E8M0 scale + 倒数
+
+if constexpr (QuantMode == E2M1_QUANT) {                  // ← A4W4 走这里
+    Quant::ComputeFp4Data<bfloat16_t, QuantOutType, CAST_TRUNC, CAST_RINT>(
+        srcAddr, halfScaleAddr, outDataAddr, hiddenDim);  // ③ 量化成 FP4 E2M1
+} else {
+    Quant::ComputeFp8Data<...>(...);                      // FP8（A8W8/A8W4）
+}
+```
+
+其中 `QuantMode == E2M1_QUANT`、`QuantOutType = fp4x2_e2m1_t`（`x2` = 2 元素/字节）。`QuantizeLocalTokens`（`:121-169`）由各 AIV 分工，把量化结果（数据 + scale）逐 token 交织写进 peermem 的 `quantTokenScale` 区。
+
+### 18.3 MXFP4 三步走（每步都做了什么）
+
+三步函数都在 `quantize_functions.h`，与 FP8 同构，只换目标 dtype。
+
+**① `ComputeMaxExp`（`:81-138`）**：提取 BF16 指数位（`Reg::And` 上 `MAX_EXP_FOR_BF16=0x7f80`），对**每 32 个元素**做 `ReduceDataBlock<MAX>`，得到「组内最大指数」。`blockPerReg = 256/32 = 8`，对应 **group = 32**（`MXFP_SCALE_GROUP_NUM`，`mega_moe_constants.h:69`）。
+
+**② `ComputeScale`（`:172-243`）**：把「组内最大指数」转成两个值——但 `maxExponent` 用的是 **FP4 自己的上界**：
+
+```cpp
+if constexpr (Std::IsSame<T, fp4x2_e2m1_t>::value) {
+    maxExponent = FP4_E2M1_BF16_MAX_EXP;   // = 0x0100，对应 FP4 E2M1 的最大指数
+}
+```
+
+- `mxScale`：E8M0 格式的共享指数（= 组内最大指数 − FP4 最大指数）。
+- `recipScale`：缩放用**倒数** `2^{-shared_exp}`（`Reg::Sub(scaleBias, sharedExp)`）。
+
+**③ `ComputeFp4Data`（`:464-518`）**：FP4 与 FP8 唯一不同的步骤：
+
+```cpp
+Reg::Mul(vdExp0, vdExp0, halfScaleForMul);   // x · 2^{-shared_exp}（缩放到 FP4 范围）
+Reg::Cast<U, T, castTraitZero>(vdExp0FP4, vdExp0);   // BF16 → FP4 E2M1（低位 nibble）
+Reg::Cast<U, T, castTraitOne >(vdExp1FP4, vdExp1);   // （高位 nibble）
+Reg::Add((uint8_t&)vdExp0FP4, (uint8_t&)vdExp0FP4, (uint8_t&)vdExp1FP4);  // 两 nibble 合并 1 字节
+Reg::DataCopy<int8_t, DIST_PACK_B32>(outLocalAddr, ..., OUT_ELE_NUM_PER_LOOP_FP4);
+```
+
+`castTraitZero`/`castTraitOne` 分别把元素 cast 到字节的**低位/高位 nibble**，`Reg::Add` 把两个 4-bit 合并成 1 字节——这就是 `fp4x2` 的「2 元素/字节」打包。
+
+量化数学本质：
+
+$$x_{fp4} = \mathrm{cast}_{E2M1}\Big(x_{bf16} \cdot 2^{-k}\Big), \qquad k = e_{\max}^{block} - e_{\max}^{FP4}$$
+
+即**把每组 32 个元素统一缩放到 FP4 可表示范围（max≈6），再逐元素 cast 到最近的 FP4 E2M1 值**，scale 用 E8M0 存共享指数。
+
+### 18.4 FP4 E2M1 格式详解
+
+FP4 E2M1 是 OCP MX 规范里的 4-bit 浮点：
+
+| 字段 | 位数 | 说明 |
+|---|---|---|
+| 符号 S | 1 | 正负 |
+| 指数 E | 2 | bias = 1 |
+| 尾数 M | 1 | 隐含 1（normal）/ 0（subnormal） |
+
+可表示的正值集合：
+
+| 二进制 E.M | 值 |
+|---|---|
+| 00.0 | 0 |
+| 00.1 | 0.5（最小 subnormal） |
+| 01.0 | 1 |
+| 01.1 | 1.5 |
+| 10.0 | 2 |
+| 10.1 | 3 |
+| 11.0 | 4 |
+| 11.1 | **6（最大 = ±2²×(1+0.5)）** |
+
+- **最大幅度 = 6.0**，正是 `FP4_E2M1_BF16_MAX_EXP = 0x0100` 对应的指数。
+- 该 MX 变体里 `11.1 = 6` 是正常值，**无 inf/NaN**。
+- 相对精度很粗（1 位尾数，相邻值最小间隔 0.5），但配合 E8M0 共享指数，每组能覆盖 `6 × 2^scale` 的宽动态范围。
+
+### 18.5 带数字的例子
+
+某 token 一行 H=1024，量化成 32 个组。取一组 32 个 BF16 元素，组内最大 `|x| = 2.4`：
+
+```text
+① ComputeMaxExp: 组内最大指数 e_max（≈2，因 2.4 ∈ [2,4)）
+② ComputeScale :
+     shared_exp = e_max - e_max_FP4 = 2 - 2 = 0   （FP4 最大指数也是 2）
+     scale      = E8M0(0)；recipScale = 2^0 = 1.0
+③ ComputeFp4Data: 每个元素 x → x × 1.0 → cast 最近 FP4 值
+     e.g. 2.4 → 2.0；1.7 → 1.5；0.6 → 0.5
+     每 2 个元素打包 1 字节
+```
+
+若组内最大值更大（超过 6），`shared_exp` 变负、`recipScale = 2^{+k}` 放大整组，让最大值落进 `[0,6]`。E8M0 共享指数让不同量级的组各自自适应缩放，这正是 MX 量化相比 per-tensor 量化的精度优势来源。
+
+### 18.6 A4W4-FP 与 A8W8/A8W4 阶段① 的对比
+
+| 场景 | 目标类型 | 量化函数 | 每字节元素数 | 元素范围 |
+|---|---|---|---|---|
+| A8W8-FP | FP8 E4M3/E5M2 | `ComputeFp8Data` | 1 | ±448 / ±57344 |
+| A8W4-FP | FP8 E4M3 | `ComputeFp8Data` | 1 | ±448 |
+| **A4W4-FP** | **FP4 E2M1** | **`ComputeFp4Data`** | **2** | **±6** |
+
+三者共用 `ComputeMaxExp` + `ComputeScale`，只有最后一步不同；`ComputeScale` 里的 `maxExponent` 也按目标类型选 `FP4_E2M1_BF16_MAX_EXP` / `FP8_E4M3_MAX_EXP` / `FP8_E5M2_MAX_EXP`。
+
+### 18.7 小结
+
+- **方法**：MXFP4 逐组量化（group=32，E8M0 共享指数），目标 FP4 E2M1（`fp4x2_e2m1_t`），2 元素/字节。
+- **三步**：`ComputeMaxExp`（组内最大指数）→ `ComputeScale`（E8M0 scale + 倒数，maxExponent 用 FP4 上界）→ `ComputeFp4Data`（缩放 + cast E2M1 + nibble 打包）。
+- **为什么 FP4**：权重 W1 是 FP4 E2M1，激活配成 FP4 才能做 A4W4（FP4×FP4）；且 FP4 只在输入侧用，SwiGLU 输出仍提升为 FP8 E4M3 供 GMM2。
+- **格式**：FP4 E2M1 = 1 符号 + 2 指数 + 1 尾数，值集合 {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}，max=6，无 inf/NaN。
+
+**参考来源：**
+
+- [OCP Microscaling Formats (MX) — MXFP4 E2M1 规范（经 HiFloat4 论文摘要转述）](https://ar5iv.labs.arxiv.org/html/2604.08826)
+- [LLVM PR #108877 — Add f4E2M1FN type（E2M1 格式定义）](https://github.com/llvm/llvm-project/pull/108877)
+- [openxla/stablehlo PR #2582 — Add MX floating point types (f4E2M1FN, f8E8M0FNU)](https://github.com/openxla/stablehlo/pull/2582)
+
+### 18.8 补充：量化公式的代码级工作原理（k 与 2^{-k} 的位运算推导）
+
+**原问题：**
+
+> A4W4-FP 阶段① 量化公式 $x_{fp4} = \mathrm{cast}_{E2M1}(x_{bf16} \cdot 2^{-k})$，$k = e_{\max}^{block} - e_{\max}^{FP4}$，请结合代码仔细解释这个公式具体怎么工作。
+
+**回答：**
+
+先把公式符号对齐到代码变量，再逐步追踪位运算：
+
+- **$e_{\max}^{block}$**：块内 32 元素里最大的二进制指数（`floor(log2(max|x|))`）。
+- **$e_{\max}^{FP4}$**：FP4 E2M1 最大指数 = **2**（max=6=2²×1.5）。
+- **$k$**：两者之差（要把这组数放大/缩小多少个 2 的幂）。
+- **$2^{-k}$**：实际缩放因子（`recipScale`）。
+
+三个量由 `ComputeMaxExp → ComputeScale → ComputeFp4Data` 三步算出（`quantize_functions.h`）。
+
+#### 第一步 `ComputeMaxExp`：求 $e_{\max}^{block}$（`:81-138`）
+
+BF16 布局 = 1 符号 + 8 指数（bits 14:7）+ 7 尾数。用掩码提取指数域：
+
+```cpp
+constexpr uint16_t MAX_EXP_FOR_BF16 = 0x7f80;   // 0b0111_1111_1000_0000，只保留 bits 14:7
+Reg::And(xExpExtract, (uint16_t&)xBF16, expMaskBF16, mask);   // 提取指数域
+Reg::Max(xMaxExp, xExpExtract0, xExpExtract1, mask);          // 32 元素取最大
+Reg::ReduceDataBlock<MAX>(xMaxExp, xMaxExp, mask);            // 每 32 个归约出 1 个
+```
+
+**不用求 abs**：指数位在固定位置，`x & 0x7f80` 直接得到指数域，取 MAX 即得「幅度最大元素的指数」。结果 `maxExpAddr[j]` 存**原始指数域**（含 bias 127）：`E_raw = e_max^block + 127`，数值上 = `E_raw << 7`。
+
+#### 第二步 `ComputeScale`：算 k 和 2^{-k}（`:172-243`）
+
+三个关键常量（`:24-37`）：
+
+```cpp
+FP4_E2M1_BF16_MAX_EXP = 0x0100;   // = (2 << 7)，FP4 最大指数 2
+BF16_EXP_BIAS = 0x7f00;           // = (254 << 7)，用于构造倒数
+SHR_NUM_FOR_BF16 = 7;             // 指数域在 bits 14:7，移位量 7
+```
+
+核心算术：
+
+```cpp
+Reg::Sub(sharedExp, xMaxExp, maxExpValue, ...);   // ① sharedExp = (E_raw - 2) << 7
+Reg::ShiftRights(scaleValue, sharedExp, 7, ...);  // ② scaleValue = E_raw - 2 → E8M0 scale
+Reg::Sub(recipScale, scaleBias, sharedExp, ...);  // ③ recipScale = 0x7f00 - sharedExp → 2^{-k}
+```
+
+**① sharedExp**：`(E_raw - 2) << 7`。右移 7 位得 `scaleValue = E_raw - 2 = (e_max^block + 127) - 2 = k + 127`，即 **k 的偏置 127 编码**——正好是 E8M0 格式（bias 127），反量化解码成 `2^(scaleValue - 127) = 2^k`。
+
+**② recipScale**：`0x7f00 - sharedExp = (256 - E_raw) << 7`。重新解释成 BF16（指数域 = 256 - E_raw），数值 = `2^((256-E_raw)-127) = 2^(2-e_max^block) = 2^{-k}`。所以 **recipScale（作为 BF16）= 2^{-k}**，正是公式里要乘的缩放因子。
+
+#### 第三步 `ComputeFp4Data`：乘 scale 再 cast（`:464-518`）
+
+对 BF16 输入（`:506-515`）：
+
+```cpp
+Reg::Mul(vdExp0, vdExp0, (T&)halfScaleForMul, ...);   // x · 2^{-k}
+Reg::Cast<U, T, castTraitZero>(vdExp0FP4, vdExp0, ...);   // BF16 → FP4 E2M1（低位 nibble）
+Reg::Cast<U, T, castTraitOne >(vdExp1FP4, vdExp1, ...);   // （高位 nibble）
+Reg::Add((uint8_t&)vdExp0FP4, (uint8_t&)vdExp0FP4, (uint8_t&)vdExp1FP4);  // 两 nibble 合并 1 字节
+Reg::DataCopy<int8_t, DIST_PACK_B32>(outLocalAddr, ..., OUT_ELE_NUM_PER_LOOP_FP4);
+```
+
+`halfScaleForMul` 即 `recipScale`，乘法把每个元素缩放到 FP4 范围，`Cast` 就近取整到 E2M1 的 {0, 0.5, 1, 1.5, 2, 3, 4, 6}，两个 nibble 合并 1 字节（2 元素/字节）。
+
+#### 完整数字例子（缩放「下」，块值太大）
+
+块内最大 `|x| = 8.0`：
+
+```text
+① e_max^block = 3（8=2³），E_raw = 130，maxExpAddr = 130<<7 = 0x4100
+② sharedExp = (130-2)<<7 = 0x4000
+   scaleValue(E8M0) = 130-2 = 128 → 解码 2^(128-127) = 2（dequant scale）
+   recipScale = (256-130)<<7 = 126<<7 → BF16 指数域 126 → 2^(126-127) = 0.5 = 2^{-k}，k=1
+③ x → x × 0.5 → cast E2M1：8.0→4.0（精确）；4.8→2.4≈2
+   反量化 x ≈ x_fp4 × 2 ✓
+```
+
+#### 缩放「上」的例子（块值偏小）
+
+块内最大 `|x| = 2.4`：
+
+```text
+e_max^block = 1，k = 1-2 = -1
+recipScale = 2^{-(-1)} = 2
+x_fp4 = cast(x·2)：2.4→4.8→4；0.6→1.2→1
+E8M0 scale = 2^{-1} = 0.5；反量化 x ≈ x_fp4 × 0.5 ✓
+```
+
+**scale 永远把块的「最大指数」对齐到 FP4 最大指数 2**，让块内数据占满 FP4 的 [0,6] 动态范围。
+
+#### 为什么 scale 一定是 2 的整数次幂
+
+E8M0 只有指数位、无尾数位，只能表示 2 的整数次幂，所以缩放因子必须是 2^{-k} 这种纯指数形式。这也解释了为什么公式用「指数差」而非「值之比」`log2(6/max)`（后者是非整数，无法被 E8M0 表示）。
+
+#### 边界情况（`:221-237` 的保护分支）
+
+| 情况 | 判断 | 处理 |
+|---|---|---|
+| inf/nan | `xMaxExp == 0x7f80` | scale 置 nan（`0x00ff`） |
+| 全零块 | `xMaxExp == 0` | scale 置 0 |
+| 极小 subnormal 块 | `xMaxExp <= 2` | 截断 `xMaxExp` 到 `maxExpValue` |
+
+#### 小结：公式 ↔ 代码 三步对照
+
+| 公式项 | 代码步骤 | 关键位运算 |
+|---|---|---|
+| $e_{\max}^{block}$ | `ComputeMaxExp` | `x & 0x7f80` → `ReduceDataBlock<MAX>`（每 32 个） |
+| $k = e_{\max}^{block} - 2$ | `ComputeScale` 的 `sharedExp >> 7` | `(E_raw - 2) << 7` 再 `>> 7` |
+| E8M0 scale（=2^k） | `scaleValue = k + 127` | 偏置编码后存 `mxScaleAddr` |
+| $2^{-k}$（乘数） | `recipScale = 0x7f00 - sharedExp` | 得到 BF16 值 `2^{-k}` 存 `halfScaleAddr` |
+| $x_{fp4}$ | `ComputeFp4Data` | `x · recipScale` → `Cast` E2M1 → nibble 打包 |
+
+一句话：**先取块内最大指数，减去 FP4 最大指数 2 得 k，构造纯指数缩放因子 2^{-k}（E8M0 存 2^k、BF16 倒数存 2^{-k}），把块内元素乘到 [0,6] 再就近 cast 成 4-bit**——全程只有指数加减和移位，没有浮点除法。
