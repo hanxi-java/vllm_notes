@@ -16,8 +16,10 @@
     - [5. 在 mega_moe 算子里的落地（总体流程）](#5-在-mega_moe-算子里的落地总体流程)
 - [第二章 与算子相关的 A5 知识准备](#第二章-与算子相关的-a5-知识准备)
   - [950中的AIC 与 AIV](#950中的aic-与-aiv)
+    - [Ascend 950 分离式 AIC/AIV 架构](#ascend-950-分离式-aicaiv-架构)
+    - [与 NVIDIA GPU SM 架构的对比](#与-nvidia-gpu-sm-架构的对比)
     - [950 有多少个 AIC 和 AIV](#950-有多少个-aic-和-aiv)
-    - [mega moe中的 逻辑 block](#mega-moe中的-逻辑-block)
+    - [MegaMoe 中的逻辑 block](#megamoe-中的逻辑-block)
   - [peermem 对称窗口（A5 通信底座）](#peermem-对称窗口a5-通信底座)
 - [第三章 整体架构与调用链](#第三章-整体架构与调用链)
   - [1. 整体架构与调用链](#1-整体架构与调用链)
@@ -304,6 +306,163 @@ flowchart LR
 # 第二章 与算子相关的 A5 知识准备
 ## 950中的AIC 与 AIV
 
+### Ascend 950 分离式 AIC/AIV 架构
+
+Ascend 950PR/950DT 采用 **Cube/Vector 分离式架构**。这里的“分离”是指：矩阵计算单元 Cube 和向量计算单元 Vector 不再放在同一个物理核中，而是拆成两类可以独立加载代码、独立执行的核心：
+参考：
+https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910/API/ascendcopapi/docs/api/SIMD-API/%E5%9F%BA%E7%A1%80API/%E5%90%8C%E6%AD%A5%E6%8E%A7%E5%88%B6/%E6%A0%B8%E9%97%B4%E5%90%8C%E6%AD%A5/%E6%A0%B8%E9%97%B4%E5%90%8C%E6%AD%A5%E8%83%BD%E5%8A%9B%E6%A6%82%E8%BF%B0.md
+- **AIC（AI Cube Core）**：以 Cube 矩阵乘加为中心；
+- **AIV（AI Vector Core）**：以 Vector 向量计算、数据重排和搬运为中心；
+- 一组 AIC/AIV 在 CANN 编程模型中组合成一个**逻辑 AI Core**。
+
+可以简化表示为：
+
+```text
+Ascend 950 NPU
+└── 多个逻辑 AI Core / 混合核组
+    ├── AIC（AI Cube Core）
+    │   ├── Scalar：地址、循环和指令调度
+    │   ├── Cube：矩阵乘加
+    │   ├── MTE：数据搬运
+    │   ├── L1
+    │   ├── L0A / L0B：Cube 输入
+    │   ├── L0C：Cube 累加结果
+    │   └── FixPipe / BT Buffer 等
+    │
+    └── AIV（AI Vector Core）
+        ├── Scalar：地址、循环和指令调度
+        ├── Vector：向量、逐元素和数据重排计算
+        ├── MTE：GM 与 UB 之间的数据搬运
+        ├── UB（Unified Buffer）
+        └── Vector Register
+```
+
+#### AIC：面向矩阵密集计算
+
+AIC 主要执行规则、计算密集的矩阵乘加，例如：
+
+- GMM1：`X · W_gate/up`；
+- GMM2：`Activation · W_down`；
+- 其他 GEMM、卷积或 Cube 类计算。
+
+典型 Cube 数据流为：
+
+```text
+GM
+ ↓ MTE2
+L1
+ ↓ MTE1
+L0A / L0B
+ ↓
+Cube MMAD
+ ↓
+L0C
+ ↓ FixPipe
+GM 或 L1
+```
+
+#### AIV：面向向量计算、数据重排和搬运
+
+AIV 主要执行：
+
+- SwiGLU 等逐元素激活；
+- 量化、反量化和 scale 处理；
+- FP4/FP8 数据展开和格式变换；
+- Dispatch、Combine、Unpermute 中的索引与数据组织；
+- mask、计数、前缀和等控制类计算；
+- GM、UB 和寄存器之间的数据搬运。
+
+典型 Vector 数据流为：
+
+```text
+传统 Vector SIMD：GM → UB → Vector → UB → GM
+
+950 Reg Vector：   GM → UB → Register → Vector
+                             → Register → UB → GM
+```
+
+#### 外层 SPMD，核内异构流水线
+
+Ascend 算子的主流执行模式可以理解为：
+
+```text
+外层：多个逻辑 block / AI Core 执行 SPMD
+内层：Scalar、Cube、Vector、MTE 多流水线并行
+```
+
+Scalar 负责循环、地址计算和指令发射；Cube、Vector、MTE 从各自的指令队列异步执行。存在数据依赖时，需要通过事件、跨核 flag 或 GM 状态进行同步。
+
+这和“让大量 Warp 等待硬件调度”的 GPU 思路不同。Ascend 算子通常更强调：
+
+1. Tiling：把全局 Tensor 切成适配本地存储的 tile；
+2. CopyIn：通过 MTE 把数据从 GM 搬进 L1/UB；
+3. Compute：由 Cube 或 Vector 计算；
+4. CopyOut：通过 MTE/FixPipe 把结果写回；
+5. 使用多 Buffer 和事件同步，使搬运与计算形成流水。
+
+#### block 与 subblock
+
+在 Cube/Vector 分离架构的混合 kernel 中，CANN 使用 **block/subblock** 表示 AIC/AIV 的配对关系：
+
+```text
+KERNEL_TYPE_MIX_AIC_1_2
+
+一个逻辑 block
+├── 1 个 AIC：block
+├── 1 个 AIV：subblock 0
+└── 1 个 AIV：subblock 1
+```
+
+对应的关键接口是：
+
+- `GetBlockNum()`：当前 kernel 配置的逻辑 block 数；
+- `GetBlockIdx()`：当前 AIC/AIV 的执行索引；
+- `GetTaskRation()`：当前核相对于逻辑 AI Core 的启动比例，AIC 返回 1、AIV 返回 2；
+- `GetSubBlockIdx()`：区分同一逻辑 block 内的 AIV0/AIV1。
+
+这正是 MegaMoe 使用 `1 AIC + 2 AIV` 逻辑 block 的硬件和编程模型基础。
+
+### 与 NVIDIA GPU SM 架构的对比
+
+两者都支持大规模并行，也都有矩阵、向量、存储和调度资源，但组织方式不同：
+
+| 对比项 | NVIDIA GPU | Ascend 950 |
+|---|---|---|
+| 主要并行单元 | SM | 逻辑 AI Core；物理上拆成 AIC/AIV |
+| 普通计算 | SM 内的 CUDA Core | AIV 内的 Vector/SIMD 资源 |
+| 矩阵计算 | SM 内的 Tensor Core | AIC 内的 Cube Unit |
+| 调度中心 | Warp Scheduler 调度就绪 Warp | Scalar 发射 Cube/Vector/MTE 指令，软件显式组织流水 |
+| 主要编程模型 | SIMT：Thread → Warp → Block | 外层 SPMD + 内层 Cube/Vector SIMD 流水 |
+| 本地存储 | Register、Shared Memory/L1 | AIC 的 L1/L0，AIV 的 UB/Register |
+| 数据搬运 | Load/Store、缓存层次、TMA 等 | MTE1/MTE2/MTE3、FixPipe，数据路径更显式 |
+| 延迟隐藏 | 多 Warp 驻留和切换 | CopyIn/Compute/CopyOut 多流水线和多 Buffer 重叠 |
+| 矩阵/向量关系 | Tensor Core、CUDA Core同处一个 SM | Cube 与 Vector 位于不同物理核 |
+
+可以建立下面的**近似功能映射**：
+
+```text
+GPU SM              ≈ Ascend 逻辑 AI Core（仅为粗粒度类比）
+GPU Tensor Core     ≈ Ascend Cube Unit
+GPU CUDA Core       ≈ Ascend Vector/SIMD 执行资源
+GPU Load/Store      ≈ Ascend MTE/FixPipe 数据搬运流水线
+```
+
+但不能把 MegaMoe 的逻辑 block 直接等同于 CUDA Thread Block：
+
+| 项目 | CUDA Thread Block | MegaMoe 逻辑 block |
+|---|---|---|
+| 组成 | 多个 CUDA Thread/Warp | 1 个 AIC + 2 个 AIV |
+| 硬件落点 | 整个 Thread Block 驻留在一个 SM | 跨三个异构物理核协作 |
+| 内部标识 | `threadIdx`、warp/lane ID | `g_coreType`、`GetSubBlockIdx()` |
+| 共享与同步 | Shared Memory、`__syncthreads()` | L1/UB/GM、跨核 flag、原子计数和轮询 |
+| 核心含义 | 同构线程工作组 | 异构 Cube/Vector 核工作组 |
+
+所以更准确的说法是：
+
+> MegaMoe 逻辑 block 是 Ascend 950 分离架构下的一个**异构 cooperative workgroup**。它在“把总任务切成多个并行工作份额”这一点上可以弱类比 CUDA Thread Block，但成员不是 Thread/Warp，也不驻留在单个 SM，因此二者不等价。
+
+另外，Ascend 950 的 AIV 本身支持 SIMT Thread/Warp/Thread Block，但那是 AIV 内部 SIMT Vector Function 的线程层次；本章 `GetBlockNum()/GetBlockIdx()` 描述的是外层混合 kernel 的逻辑核层次，两者不能混用。当前 MegaMoe arch35 代码中检查到的 Vector Function，例如 SwiGLU、MXFP8 反量化和专家计数，使用的是 `__simd_vf__`，主执行模型仍然是 AIC/AIV 混合核与 Cube/Vector SIMD 流水，而不是用 SIMT Thread Block 组织整个 MegaMoe。
+
 ### 950 有多少个 AIC 和 AIV
 
 
@@ -312,12 +471,28 @@ flowchart LR
 | 950PR | 32（满 die）/ 28（装箱版） | 64 / 56 |
 | 950DT | 36 / 32 / 28 | 72 / 64 / 56 |
 
-满 die 昇腾 950 = **36 AIC + 72 AIV**。即 **950 的 AIC 在 28~36 之间**，恒为 AIV 数的一半。mega_moe算子会动态获取。
+950PR、950DT 及不同装箱规格的可用核心数不同，因此不应把所有 Ascend 950 统一写成固定的 `36 AIC + 72 AIV`。对 MegaMoe 而言，关键不是写死某个 SKU 的数量，而是：
 
-### mega moe中的 逻辑 block
-逻辑 block中AIC 与 AIV 是 1:2 配比
+- host 侧通过 `GetCoreNumAic()` 和 `GetCoreNumAiv()` 动态获取实际可用核心数；
+- kernel 明确使用 `KERNEL_TYPE_MIX_AIC_1_2`；
+- 在当前支持的 950 配置中，以 `AIC:AIV = 1:2` 组织混合核任务。
 
-kernel 侧（`mega_moe_arch35.h:131-135`）：
+### MegaMoe 中的逻辑 block
+
+MegaMoe 的“逻辑 block”具体指 **CANN MIX 1:2 kernel 的异构核组**，其中 AIC 与 AIV 是 1:2 配比；它不是 CUDA Thread Block，也不是 Ascend SIMT VF 内部的 Thread Block。
+
+kernel 入口在 `op_kernel/arch35/mega_moe_apt.cpp:103-112` 明确声明：
+
+```cpp
+__global__ __aicore__ void mega_moe(...)
+{
+    InitSocState();
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    // ...
+}
+```
+
+kernel 内部（`op_kernel/arch35/mega_moe_arch35.h:132-135`）：
 
 ```cpp
 uint32_t blockNum_    = GetBlockNum();          // 逻辑 block 数（=AIC 数）
@@ -326,7 +501,7 @@ uint32_t blockIdx_    = GetBlockIdx() / GetTaskRation();
 uint32_t aivCoreIdx_  = GetBlockIdx();           // 直接就是 AIV 编号
 ```
 
-也就是每个 block 是 **1C2V**：1 个 AIC(Cube) + 2 个 AIV(Vector)。
+也就是每个逻辑 block 是 **1C2V**：1 个 AIC（Cube）+ 2 个 AIV（Vector）。
 
 ```text
 block 0:  [ AIC0 , AIV0, AIV1 ]
@@ -334,11 +509,35 @@ block 1:  [ AIC1 , AIV2, AIV3 ]
 block 2:  [ AIC2 , AIV4, AIV5 ]
 ...
 ```
-「AIV0 / AIV1」是每个 block 里重复出现的两个角色。后面会详细讲分工。
+映射关系可以展开为：
+
+```text
+逻辑 block b：
+
+AIC：  GetBlockIdx() = b
+       GetTaskRation() = 1
+       blockIdx_ = b / 1 = b
+
+AIV0： GetBlockIdx() = 2b
+       GetTaskRation() = 2
+       GetSubBlockIdx() = 0
+       blockIdx_ = 2b / 2 = b
+
+AIV1： GetBlockIdx() = 2b + 1
+       GetTaskRation() = 2
+       GetSubBlockIdx() = 1
+       blockIdx_ = (2b + 1) / 2 = b
+```
+
+所以 `GetBlockIdx() / GetTaskRation()` 的作用，是把 AIC/AIV 的物理执行索引归一化成共同的逻辑 block 编号；`GetSubBlockIdx()` 则区分该 block 内的 AIV0 与 AIV1。
+
+host 侧在 `op_host/op_tiling/arch35/mega_moe_tiling.cpp:2385-2401` 动态读取 AIC/AIV 数量，并在 `2415-2418` 通过 `CalcTschBlockDim(...)` 设置逻辑 block 数和 batch schedule，使全部混合核组同时启动。
+
+「AIV0 / AIV1」是每个 block 内的两个 Vector subblock 角色。后面会详细讲分工。
 
 mega moe 核角色划分（1 个 Block = 1C2V）
 
-A5 上每个 block 是「1 个 Cube（AIC）+ 2 个 Vector（AIV0 / AIV1）」：
+A5 上每个 block 是「1 个 Cube（AIC）+ 2 个 Vector（AIV0 / AIV1）」。下表是常见的主线分工；具体职责会随 A8W8/A8W4/A4W4、prefetch 开关和当前阶段变化：
 
 | 核 | 职责 |
 |---|---|
@@ -610,6 +809,15 @@ $$x_{fp4} = \mathrm{cast}_{E2M1}\Big(x_{bf16} \cdot 2^{-k}\Big), \qquad k = e_{\
 - **$2^{-k}$**：实际缩放因子（`recipScale`）。
 
 ---
+
+Ascend 950 的 MegaMoe A4W4 GMM1 中，FP4×FP4 的点积在 Cube 内部以 FP32 累加，经过 FixPipe 后形成 BF16 的 GMM1 结果；但这个 BF16 中间结果紧接着执行 SwiGLU，并被重新量化为 MXFP8 E4M3，作为 GMM2 的输入。
+后面的流程类似，不再单独指出。
+
+对于 Ascend 950 上 MegaMoe 的 A4W4 GMM1：
+MXFP4 激活 + E8M0 scale ×  MXFP4 权重 + E8M0 scale  --> Cube 内部 FP32 累加
+--> BF16 GMM1 结果(FixPipe 转换)  --> AIV 上执行 SwiGLU（FP32 寄存器计算）
+BF16 激活结果 -->  MXFP8 E4M3 + E8M0 scale(再量化)  --> 送入 A8W4 GMM2
+
 # 第六章 阶段② 路由 mask 广播
 
 举例假设：
