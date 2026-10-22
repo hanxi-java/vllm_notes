@@ -1,5 +1,24 @@
 # 混合注意力与 KV Cache 加载逻辑
 
+## 目录
+
+- [问题](#问题)
+- [源码范围](#源码范围)
+- [一、结论概览](#一结论概览)
+- [二、模型层面的混合注意力](#二模型层面的混合注意力)
+- [三、为什么需要多个 KV Cache Group](#三为什么需要多个-kv-cache-group)
+- [四、本地 KV Cache 的分配和绑定](#四本地-kv-cache-的分配和绑定)
+- [五、本地 Prefix Cache 命中并不是一次数据加载](#五本地-prefix-cache-命中并不是一次数据加载)
+- [六、多个 Group 如何协调 Prefix Cache 命中](#六多个-group-如何协调-prefix-cache-命中)
+- [七、外部 KV Cache 的加载主流程](#七外部-kv-cache-的加载主流程)
+- [八、AscendStore 非 Layerwise 加载](#八ascendstore-非-layerwise-加载)
+- [九、Ascend Mooncake Layerwise Hybrid 加载](#九ascend-mooncake-layerwise-hybrid-加载)
+- [十、Mamba/GDN 加载后的 State Copy](#十mambagdn-加载后的-state-copy)
+- [十一、完整示例](#十一完整示例)
+- [十二、最终理解](#十二最终理解)
+- [十三、验证边界](#十三验证边界)
+- [十四、Sliding Window Attention 在哪些模型中使用](#十四sliding-window-attention-在哪些模型中使用)
+
 ## 问题
 
 请结合 `D:\Code\vllm-ascend\vllm-ascend` 和 `D:\Code\vllm-github` 的内容，分析什么是混合注意力，以及它的 KV Cache 加载逻辑是怎样的。
@@ -745,3 +764,487 @@ L = 128
 - layerwise pipeline 一定带来性能收益。
 
 这些结论仍需通过真实模型、NPU trace、Mooncake 日志、冷/热 cache 输出一致性和性能基准进一步验证。
+
+---
+
+## 十四、Sliding Window Attention 在哪些模型中使用
+
+### 14.1 原问题
+
+> 请你结合 `D:\Code\vllm-ascend\vllm-ascend` 和 `D:\Code\vllm-github` 的代码内容，继续回答以下问题。你在回答问题的时候可以辅助进行一些网络知识的搜索，请尽量详细回答，并配合适当举例和图表。我的问题如下：  
+> 基于上面的回答，我有以下问题：1. Sliding Window Attention 在哪些模型中使用？
+
+### 14.2 结论
+
+Sliding Window Attention（SWA，滑动窗口注意力）并不只用于 Mistral。结合当前两个仓库，典型模型包括：
+
+- Mistral 7B、Mistral Instruct、Ministral；
+- Gemma 2、Gemma 3、Gemma 4；
+- OpenAI gpt-oss-20b、gpt-oss-120b；
+- Cohere Command R/Cohere2 的部分版本；
+- EXAONE 4 的部分规格；
+- GraniteSWA、GraniteMoeSWA；
+- Apertus、Jais2、PLaMo3、MiniMax-M2/M3 等较新的模型；
+- Ascend 中还有 DeepSeek-V4/V4.1 的 DSA 窗口化路径。
+
+但“配置或代码中出现 `sliding_window`”并不自动等价于“这个 checkpoint 正在使用 SWA”。必须至少结合以下三层判断：
+
+1. **模型配置层**：具体 checkpoint 的 `sliding_window` 是否非空，哪些层的 `layer_types` 是 `sliding_attention`；
+2. **vLLM 模型实现层**：模型是否真的把窗口传入 `Attention(per_layer_sliding_window=...)`；
+3. **Cache/后端层**：vLLM 是否为该层生成 `SlidingWindowSpec`，后端是否支持并实际执行窗口化读取。
+
+本节分析对应的本地源码版本为：
+
+- 上游 vLLM：`main@027b6f3a22f40b057474f053278e6323d81462b9`；
+- vLLM-Ascend：`l2_928@d007e4205d93fd746d4bc61ed19ed3761044a73f`。
+
+以下属于静态源码分析，不代表已经对每个模型 checkpoint 做过运行验证。
+
+### 14.3 SWA 的基本语义
+
+对于位置为 `t` 的 token，Full Attention 可以直接读取：
+
+```text
+[0, t]
+```
+
+窗口大小为 `W` 的因果 Sliding Window Attention 只能直接读取：
+
+```text
+[max(0, t-W+1), t]
+```
+
+例如 `W=4`：
+
+| 当前 token | Full Attention 可见 token | SWA 可见 token |
+| ---: | --- | --- |
+| 2 | 0、1、2 | 0、1、2 |
+| 5 | 0～5 | 2、3、4、5 |
+| 9 | 0～9 | 6、7、8、9 |
+
+其直接效果是：
+
+- Full Attention 需要访问从序列开头到当前 token 的历史 K/V；
+- SWA 执行当前层时，主要访问最近 `W` 个 token 的 K/V；
+- 多层 SWA 的有效感受野仍会逐层扩大，因为上一层的 token 表示已经融合过它自己的历史窗口。
+
+所以“窗口为 4096”并不代表深层输出完全不含 4096 token 以前的信息；它表示单层注意力的直接 K/V 访问范围受限。
+
+### 14.4 vLLM 如何判定某一层是 SWA
+
+vLLM 中的主要链路如下：
+
+```text
+checkpoint config.sliding_window / config.layer_types
+                    │
+                    ▼
+模型层创建 Attention(
+    per_layer_sliding_window=...
+)
+                    │
+                    ▼
+Attention.get_kv_cache_spec()
+                    │
+          ┌─────────┴─────────┐
+          ▼                   ▼
+ window 非空            window 为空
+SlidingWindowSpec       FullAttentionSpec
+```
+
+关键代码位置：
+
+- `D:\Code\vllm-github\vllm\model_executor\layers\attention\attention.py:252`：`Attention` 接收 `per_layer_sliding_window`；
+- `D:\Code\vllm-github\vllm\model_executor\layers\attention\attention.py:265-272`：选择逐层窗口或模型级窗口；
+- `D:\Code\vllm-github\vllm\model_executor\layers\attention\attention.py:339`：保存为 `self.sliding_window`；
+- `D:\Code\vllm-github\vllm\model_executor\layers\attention\attention.py:606-668`：`get_kv_cache_spec()` 根据窗口生成 `SlidingWindowSpec` 或 `FullAttentionSpec`。
+
+因此，判断某个具体 checkpoint 是否真正使用 SWA，至少需要确认：
+
+1. 配置中存在非空的 `sliding_window`；
+2. 当前层在 `layer_types` 中标为 `sliding_attention`，或者架构约定所有层都使用 SWA；
+3. 模型实现把窗口传给 `Attention`；
+4. 最终为这些层创建了 `SlidingWindowSpec`。
+
+### 14.5 Mistral 7B、Mistral Instruct 和 Ministral
+
+Mistral 7B 是最典型的 SWA 模型之一。原始 Mistral 7B 使用约 4096 token 的滑动窗口，所有 Transformer 层都按窗口注意力运行。官方说明参见：
+
+- <https://mistral.ai/news/announcing-mistral-7b>
+
+当前 vLLM 会对 Mistral 配置做规范化：
+
+- 如果 `sliding_window` 是整数且没有显式 `layer_types`，则所有层被设为 `sliding_attention`；
+- 如果窗口配置是逐层列表，则可按层决定 Full Attention 或 SWA。
+
+相关代码：
+
+- `D:\Code\vllm-github\vllm\transformers_utils\configs\mistral.py:176-194`；
+- `D:\Code\vllm-github\vllm\model_executor\models\mistral.py:77`：MistralAttention 继承 LlamaAttention；
+- `D:\Code\vllm-github\vllm\model_executor\models\llama.py:185-219`：根据层类型传递 `per_layer_sliding_window`。
+
+典型结构：
+
+```text
+Mistral 7B
+
+Layer 0   SWA, W=4096
+Layer 1   SWA, W=4096
+Layer 2   SWA, W=4096
+...
+Layer 31  SWA, W=4096
+```
+
+需要注意，当前仓库的 Mixtral 实现在 Attention 构造处没有明确传入 `per_layer_sliding_window`。因此不能只因 Mixtral 属于 Mistral 系，或者配置可能含有同名字段，就断言当前实现必然生成 `SlidingWindowSpec`。
+
+### 14.6 Gemma 2
+
+Gemma 2 使用交替的局部滑动窗口层和全局注意力层。Google 的架构说明参见：
+
+- <https://developers.googleblog.com/en/gemma-explained-new-in-gemma-2/>
+
+结构可简化为：
+
+```text
+Layer 0   Sliding Window
+Layer 1   Full Attention
+Layer 2   Sliding Window
+Layer 3   Full Attention
+...
+```
+
+vLLM 的混合 KV Cache 设计文档把 Gemma 2 概括为约 `1 SW : 1 Full`：
+
+- `D:\Code\vllm-github\docs\design\hybrid_kv_cache_manager.md:77-80`。
+
+模型实现会检查当前层类型，只对滑动窗口层传入窗口：
+
+- `D:\Code\vllm-github\vllm\model_executor\models\gemma2.py:154-166`。
+
+因此 Gemma 2 是很典型的 Hybrid Attention 模型：
+
+```text
+同一个模型
+├── 一部分层：SlidingWindowSpec
+└── 一部分层：FullAttentionSpec
+```
+
+其 KV Cache 不能被当作“整个模型只有一种 Cache 类型”。
+
+### 14.7 Gemma 3
+
+Gemma 3 进一步提高了局部窗口层的比例。Google 官方介绍给出的典型周期是 5 个 Local SWA 层后接 1 个 Global Full Attention 层，局部窗口通常为 1024 token：
+
+- <https://developers.googleblog.com/en/gemma-explained-whats-new-in-gemma-3/>
+
+```text
+Gemma 3 一个周期
+
+L0  SWA, W=1024 ─┐
+L1  SWA, W=1024  │
+L2  SWA, W=1024  ├── 局部建模
+L3  SWA, W=1024  │
+L4  SWA, W=1024 ─┘
+L5  Full Attention ── 全局信息汇聚
+```
+
+vLLM 对应实现：
+
+- `D:\Code\vllm-github\vllm\model_executor\models\gemma3.py:152-198`。
+
+在 vLLM 的混合 KV Cache 示例中，Gemma 3 27B 被描述为：
+
+- 52 个 SWA 层；
+- 10 个 Full Attention 层。
+
+位置：
+
+- `D:\Code\vllm-github\docs\design\hybrid_kv_cache_manager.md:113-121`。
+
+Gemma 1 主要使用全局注意力，不能因为名字相近就归为 SWA 模型。
+
+### 14.8 Gemma 4
+
+当前 vLLM 已包含 Gemma 4 的逐层 SWA 支持：
+
+- `D:\Code\vllm-github\vllm\model_executor\models\gemma4.py:449-518`。
+
+代码会读取每层类型、决定窗口，并把窗口传入 Attention。多模态场景中还会对图像前缀相关窗口做额外处理。
+
+从代码能够确认的是“架构实现支持逐层 Full/SWA”；某个具体 Gemma 4 checkpoint 有多少 SWA 层，仍应以它自己的 `config.json` 为准。
+
+### 14.9 OpenAI gpt-oss-20b/120b
+
+gpt-oss 采用交替的全局注意力和局部带状稀疏注意力。官方资料：
+
+- <https://openai.com/index/introducing-gpt-oss/>
+- <https://cdn.openai.com/pdf/419b6906-9da6-406c-a19d-1bb078ac7637/oai_gpt-oss_model_card.pdf>
+
+vLLM 把其 locally banded sparse attention 映射成 SWA：偶数层设置 `config.sliding_window`，奇数层使用 Full Attention。
+
+- `D:\Code\vllm-github\vllm\model_executor\models\gpt_oss.py:170-182`。
+
+结构大致为：
+
+```text
+L0  SWA, W=128
+L1  Full
+L2  SWA, W=128
+L3  Full
+...
+```
+
+它和 Gemma 2 都是 Full+SWA 混合模型，但窗口大小和层比例由各自架构决定。
+
+### 14.10 Cohere Command R / Cohere2
+
+当前 vLLM 的 Command R 实现区分：
+
+- v1 模型不采用这里的交错 SWA 路径；
+- v2 模型根据 `layer_types` 设置交错 SWA。
+
+代码位置：
+
+- `D:\Code\vllm-github\vllm\model_executor\models\commandr.py:233-253`。
+
+Cohere2 MoE 也有逐层窗口支持：
+
+- `D:\Code\vllm-github\vllm\model_executor\models\cohere2_moe.py:207-233`。
+
+所以准确说法是：Cohere/Command R 的部分新版本支持或使用交错 SWA，不能把所有 Command R checkpoint 一概视为 SWA 模型。
+
+### 14.11 EXAONE 4
+
+EXAONE 4 按 `layer_types` 决定当前层使用局部还是全局注意力：
+
+- `D:\Code\vllm-github\vllm\model_executor\models\exaone4.py:171-192`。
+
+例如官方 EXAONE 4.0 32B 配置包含 `sliding_window=4096`，并通过局部层和全局层组成重复模式：
+
+- <https://huggingface.co/LGAI-EXAONE/EXAONE-4.0-32B/blob/main/config.json>
+- <https://huggingface.co/docs/transformers/en/model_doc/exaone4>
+
+但部分较小 checkpoint 可能把 `sliding_window` 设为空。因此：
+
+```text
+架构代码支持 SWA
+≠
+该架构的每一个 checkpoint 都启用了 SWA
+```
+
+### 14.12 Granite SWA 系列
+
+vLLM 注册了名称明确的两个 SWA 架构：
+
+- `GraniteSWAForCausalLM`；
+- `GraniteMoeSWAForCausalLM`。
+
+注册位置：
+
+- `D:\Code\vllm-github\vllm\model_executor\models\registry.py:127-132`。
+
+Granite 实现会解析 `layer_types` 并逐层传入窗口：
+
+- `D:\Code\vllm-github\vllm\model_executor\models\granite.py:77-104`；
+- `D:\Code\vllm-github\vllm\model_executor\models\granite.py:200-226`。
+
+仓库测试还包含 `full_attention、sliding_attention、sliding_attention` 这样的配置：
+
+- `D:\Code\vllm-github\tests\models\language\generation\test_granite.py:67-73`。
+
+需要区分普通 Granite 与名称中明确带 SWA 的 Granite 变体。
+
+### 14.13 当前 vLLM 中其他显式 SWA 实现
+
+按“模型实现明确向 Attention 传递 `per_layer_sliding_window`”这一标准，当前仓库还包括：
+
+| 分类 | 模型或实现 |
+| --- | --- |
+| 主流混合注意力 | Gemma 2/3/3n/4、gpt-oss、Command R/Cohere2 |
+| Mistral 路径 | Mistral、Ministral、部分复用 LlamaAttention 的窗口化模型 |
+| IBM/企业模型 | GraniteSWA、GraniteMoeSWA |
+| 新模型 | Apertus、Jais2、Laguna、Mellum、MiMo-V2、MiniMax-M2 |
+| MoE/新架构 | AFMoE、EXAONE MoE、Cohere Compass、MuseGlimmer |
+| 其他 | Nemotron-H、OpenPangu、PLaMo3、RNJ1、Step3.5 |
+
+代表性位置：
+
+- Apertus：`D:\Code\vllm-github\vllm\model_executor\models\apertus.py:180-199`；
+- Jais2：`D:\Code\vllm-github\vllm\model_executor\models\jais2.py:188`；
+- PLaMo3：`D:\Code\vllm-github\vllm\model_executor\models\plamo3.py:205`；
+- MiniMax-M2：`D:\Code\vllm-github\vllm\model_executor\models\minimax_m2.py:209`；
+- Nemotron-H：`D:\Code\vllm-github\vllm\model_executor\models\nemotron_h.py:489`；
+- OpenPangu：`D:\Code\vllm-github\vllm\model_executor\models\openpangu.py:485`；
+- Step3.5：`D:\Code\vllm-github\vllm\model_executor\models\step3p5.py:247`。
+
+这张表表示当前代码有显式 SWA 实现，不表示每个架构的所有公开 checkpoint 都默认启用 SWA。
+
+### 14.14 vLLM-Ascend 如何执行 SWA
+
+Ascend 支持矩阵中明确列出的典型 SWA 模型包括：
+
+- Gemma 2；
+- Gemma 3；
+- Mistral；
+- 多模态 Mistral 3/Gemma 3。
+
+位置：
+
+- `D:\Code\vllm-ascend\vllm-ascend\docs\source\user_guide\support_matrix\supported_models.md:78-81`；
+- `D:\Code\vllm-ascend\vllm-ascend\docs\source\user_guide\support_matrix\supported_models.md:173-175`。
+
+upstream vLLM 负责识别模型层类型并生成 `SlidingWindowSpec`，Ascend 后端再把窗口语义落实为 NPU Attention 参数：
+
+```text
+vLLM SlidingWindowSpec
+          │
+          ▼
+Ascend Attention metadata
+          │
+          ├── sparse_mode = 4
+          └── pre_tokens = sliding_window
+          │
+          ▼
+NPU Attention 只读取窗口范围内的历史 KV
+```
+
+关键位置：
+
+- `D:\Code\vllm-ascend\vllm-ascend\vllm_ascend\attention\attention_v1.py:605-607`。
+
+当前 Ascend FA3 后端不支持 SWA，需要 SWA 的模型应使用默认 FIA 路径：
+
+- `D:\Code\vllm-ascend\vllm-ascend\docs\source\user_guide\feature_guide\flash_attention.md:24-43`；
+- `D:\Code\vllm-ascend\vllm-ascend\docs\source\user_guide\feature_guide\flash_attention.md:139-143`。
+
+### 14.15 DeepSeek-V4/V4.1 的特殊窗口化路径
+
+Ascend 仓库中的 DeepSeek-V4/V4.1 也使用窗口概念：
+
+- DeepSeek-V4 读取 `config.sliding_window`：`D:\Code\vllm-ascend\vllm-ascend\vllm_ascend\models\deepseek_v4\model.py:487`；
+- DeepSeek-V4.1：`D:\Code\vllm-ascend\vllm-ascend\vllm_ascend\models\deepseek_v41\model.py:377`；
+- DSA 设置窗口 mask：`D:\Code\vllm-ascend\vllm-ascend\vllm_ascend\attention\dsa_v1.py:950-955`；
+- V4.1 DSA：`D:\Code\vllm-ascend\vllm-ascend\vllm_ascend\attention\dsa_v41.py:824-853`。
+
+但它不能被简单等同于 Gemma 2 的“部分 `SlidingWindowSpec` + 部分 `FullAttentionSpec`”。DeepSeek-V4/V4.1 的窗口化发生在 DSA、压缩 KV、索引选择等专用架构逻辑中，KV 表达和加载路径可能不同，应单独分析。
+
+### 14.16 容易被误认为 SWA、但实际上不是的情况
+
+#### 14.16.1 Qwen3.5/Qwen3-Next 的 GDN
+
+Qwen3.5/Qwen3-Next 主要是：
+
+```text
+GDN/Linear Attention 层
++
+Full Attention 层
+```
+
+而不是 Sliding Window Attention。其层类型是 `linear_attention` 与 `full_attention`：
+
+- `D:\Code\vllm-github\vllm\model_executor\models\qwen3_next.py:491-506`；
+- `D:\Code\vllm-github\vllm\model_executor\models\qwen3_next.py:568-574`；
+- `D:\Code\vllm-github\vllm\model_executor\models\qwen3_5.py:146-160`。
+
+GDN 保存递归状态，不是“只保存或读取最近 `W` 个普通 K/V”。
+
+#### 14.16.2 Llama 4 Chunked Local Attention
+
+Llama 4 的局部注意力在 vLLM 中有独立类型 `CHUNKED_LOCAL_ATTENTION`：
+
+- `D:\Code\vllm-github\vllm\v1\kv_cache_interface.py:139-144`。
+
+它与普通 causal SWA 的 mask、block 边界和 KV Cache 语义不完全相同。vLLM 设计文档也将 Llama 4 的 Chunked Local Attention 与 SWA 分开分类：
+
+- `D:\Code\vllm-github\docs\design\hybrid_kv_cache_manager.md:8-12`。
+
+#### 14.16.3 Jamba/Bamba 的 Mamba 层
+
+Jamba/Bamba 属于 Mamba/SSM 层与 Full Attention 层的混合。Mamba state 不是窗口化 K/V，不能归入 SWA。
+
+#### 14.16.4 Speculative Decoding 的 draft KV sliding window
+
+Ascend 还存在推测解码 Draft KV Cache 滑窗功能：
+
+- `D:\Code\vllm-ascend\vllm-ascend\docs\source\developer_guide\Design_Documents\speculative_kv_sliding_window.md:1-30`。
+
+它支持 EAGLE3、DFlash、DSpark 等 draft model，但这是推理优化：
+
+```text
+Target 模型 KV Cache：不变
+Draft 模型 KV Cache：Attention 只读取最近一段 KV
+```
+
+这不表示目标模型原生采用 SWA。文档还说明只有 FIA 的读取窗口被限制，`slot_mapping` 仍保持正常写入：
+
+- `D:\Code\vllm-ascend\vllm-ascend\docs\source\developer_guide\Design_Documents\speculative_kv_sliding_window.md:61-67`。
+
+#### 14.16.5 视觉模型的 Window Attention
+
+视觉编码器也常出现 `window_size`，但它限制的是图像 patch 的二维空间邻域，不是自回归文本 token 的历史 KV Cache，因此不能与 causal SWA 混为一谈。
+
+### 14.17 SWA 与混合 KV Cache 的对应关系
+
+| 模型类型 | 层结构示例 | KV Cache 类型 |
+| --- | --- | --- |
+| 纯 Full | 标准 Llama 2/3 | 全部 `FullAttentionSpec` |
+| 纯 SWA | Mistral 7B | 全部 `SlidingWindowSpec` |
+| Full+SWA 混合 | Gemma 2/3、gpt-oss | 多个 Full/SWA KV Cache Group |
+| SSM/GDN+Full | Jamba、Qwen3.5 | SSM/GDN state + Full KV |
+| Chunked Local+Full | Llama 4 | ChunkedLocal Spec + Full Spec |
+
+vLLM 的混合 KV Cache 设计文档明确区分：
+
+- SWA+Full：gpt-oss、Gemma 2/3、Ministral、Cohere；
+- Mamba+Full：另一类混合 Cache；
+- Chunked Local+Full：Llama 4。
+
+位置：
+
+- `D:\Code\vllm-github\docs\design\hybrid_kv_cache_manager.md:8-21`。
+
+SWA 的 prefix cache 搜索也与 Full Attention 不同。由于窗口层主要关心尾部一段 block，vLLM 会从请求右端向左检查可复用 block：
+
+- `D:\Code\vllm-github\vllm\v1\core\single_type_kv_cache_manager.py:946-1037`。
+
+但对于 Full+SWA 混合模型，最终能跳过计算的 prefix 仍然必须是所有 KV Cache Group 都能接受的共同前缀。不能因为 SWA 层只需要最近窗口，就忽略 Full Attention 层对完整连续前缀的要求。
+
+### 14.18 如何检查一个具体 checkpoint
+
+可以直接读取模型配置：
+
+```python
+from transformers import AutoConfig
+
+config = AutoConfig.from_pretrained(
+    "模型目录或模型名称",
+    trust_remote_code=True,
+)
+
+text_config = getattr(config, "text_config", config)
+
+print("sliding_window =", getattr(text_config, "sliding_window", None))
+print("layer_types =", getattr(text_config, "layer_types", None))
+```
+
+判断方式：
+
+```text
+sliding_window = None
+    → 通常没有启用原生 SWA
+
+sliding_window = 4096
+layer_types 全部是 sliding_attention
+    → 所有层使用 SWA
+
+sliding_window = 1024
+layer_types 同时有 sliding_attention/full_attention
+    → Hybrid Full+SWA
+
+配置中有 sliding_window，
+但模型构造 Attention 时没有传入窗口
+    → 不能证明当前 vLLM 实现真正使用 SWA
+```
+
+最终，针对“Sliding Window Attention 在哪些模型中使用”，更准确的回答是：
+
+> Mistral/Ministral、Gemma 2/3/4、gpt-oss、部分 Cohere/Command R、EXAONE 4、GraniteSWA，以及若干新模型架构明确支持或使用 SWA；但是否真正启用、窗口多大、哪些层启用，最终应以具体 checkpoint 的 `sliding_window`、`layer_types`、vLLM 模型构造逻辑和后端能力为准。
