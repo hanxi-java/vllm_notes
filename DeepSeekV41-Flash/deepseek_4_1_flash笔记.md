@@ -652,6 +652,12 @@
     - [29.11 Decoder SWA Bounded Replay 的例外](#2911-decoder-swa-bounded-replay-的例外)
     - [29.12 激活参数不等于 FLOPs](#2912-激活参数不等于-flops)
     - [问题 29 最终总结](#问题-29-最终总结)
+  - [问题 30：SWA 语义窗口、Chunked Prefill 在途 KV 与 Main KV 物理位置](#问题-30swa-语义窗口chunked-prefill-在途-kv-与-main-kv-物理位置)
+    - [问题 30 原问题](#问题-30-原问题)
+    - [问题 30 回答原文](#问题-30-回答原文)
+  - [问题 31：四物理 Slot 与 Chunked Prefill 的详细调用流程](#问题-31四物理-slot-与-chunked-prefill-的详细调用流程)
+    - [问题 31 原问题](#问题-31-原问题)
+    - [问题 31 回答原文](#问题-31-回答原文)
 
 ---
 
@@ -15940,3 +15946,1356 @@ Decode 新 token
 一句话概括：**Prefill 的普通 Prompt token 主要只通过 40 层主干的前 20 层，而 Decode 的新 token 必须通过全部 40 层；在每层稀疏激活模式大体相同的情况下，激活参数量因此从约 8B 变为约 16B。**
 
 本文相关结构和配置依据：`D:\Code\vllm_notes\DeepSeekV41-Flash\DeepSeek-V4.1-Flash Pushing the Limits of KV Cache Compression.pdf`，重点参见模型总览、CED/CSA2、Engram 配置和 SWA Bounded Replay 相关章节。
+
+---
+
+## 问题 30：SWA 语义窗口、Chunked Prefill 在途 KV 与 Main KV 物理位置
+
+### 问题 30 原问题
+
+请你结合 D:\Code\vllm-ascend\vllm-ascend 和 D:\Code\vllm-github的代码内容，涉及代码的时候一定要给出代码的执行过程，不要跳过。回答以下问题：在vllm-ascend适配deepseek v4.1 flash时候，你在上面回答  每层只需要保存 128 个 token 的 SWA latent， 也就是说一个block就可以了。可是你在其他窗口的回答又提及，chunked prefill 正在执行时，不仅要保留历史 SWA window，还要为当前尚未完成的 Prefill chunk 保存 KV。 我想问，这两个的差异点在哪里？如果需要为未完成的 Prefill chunk 保存 KV，那这个保存位置是和main KV 保存在同一个物理slot上吗？
+
+### 问题 30 回答原文
+
+这两个说法讨论的是两个不同口径：
+
+- “每层保存 128 个 SWA latent”说的是注意力语义上的长期有效窗口。
+- “chunked prefill 执行期间还要保存当前 chunk KV”说的是一次调度/执行过程中的瞬时物理页占用。
+
+我之前把“128 token 有效窗口”直接表述成“一个 block 就够了”，这个说法过度简化了。更准确地说：
+
+> `sliding_window=128、block_size=128` 时，每层长期有效数据量是 128 个 latent；但物理上不保证只占一个 block。稳定状态通常需要 1～2 个 block，chunked prefill 执行期间还要再加当前 chunk 的 block。
+
+当前核对的提交是：
+
+- vLLM-Ascend：`2bd3b7fcd044c51b78e5943ac64dd8208e56b543`
+- upstream vLLM：`390836a3936629475696a2416378cf2f2aee8827`
+
+## 一、128-token SWA window 和当前 Prefill chunk 的区别
+
+假设：
+
+```text
+sliding_window W = 128
+block_size      B = 128
+当前 chunk       C = 512 tokens
+```
+
+对当前 chunk 的第一个 query 来说，需要读：
+
+```text
+之前已经完成的最后 W-1 = 127 个 token
++
+当前 query 自身
+```
+
+随着 chunk 内 query 向后推进，chunk 后面的 token 也要拥有可写 KV slot。因此，在整个 chunk 执行期间，需要有物理位置覆盖：
+
+\[
+(W-1)+C=127+512=639\text{ tokens}
+\]
+
+这并不意味着每个 query 都会看见 639 个 KV。每个 query 的注意力窗口仍然最多是 128；639 是整个 chunk 执行期间所有 query 的历史尾部和当前写入位置的并集。
+
+可以这样理解：
+
+```text
+注意力语义：
+
+每个 query 只看最多 128 个位置
+             ┌─────────────┐
+... old old [history tail | 当前 chunk 中截至当前 query 的部分]
+             └─────────────┘
+
+物理写入：
+
+chunk 中所有 512 个 token 都必须先分配可写 slot
+        ┌────────────────────────────────────────┐
+        │ 127 个历史尾部 │ 512 个当前 chunk token │
+        └────────────────────────────────────────┘
+```
+
+上游 vLLM 已经把这个差异直接写入 `SlidingWindowSpec`，见 [kv_cache_interface.py:886](D:/Code/vllm-github/vllm/v1/kv_cache_interface.py:886)：
+
+```python
+num_tokens = min(
+    self.sliding_window - 1
+    + self.extra_retained_tokens
+    + max_in_flight_tokens,
+    max_model_len,
+)
+
+return cdiv(num_tokens, self.block_size) + 1
+```
+
+其中：
+
+- `sliding_window - 1`：当前 chunk 之前仍需保留的历史尾部；
+- `max_in_flight_tokens`：已调度、但输出尚未 settled 的 token 上限；
+- `+1 block`：窗口起始位置通常不与物理 block 边界对齐，因此额外保守预留一个 block。
+
+---
+
+## 二、为什么即使没有 chunk，也不一定只有一个 block
+
+`window=128`、`block_size=128` 只说明有效 token 数刚好等于一个 block 的容量，但窗口起点不一定对齐。
+
+例如已经计算到 token 1511，下一步需要保留最后 127 个历史 token：
+
+```text
+需要保留：token 1385～1511
+
+block 10：1280～1407
+block 11：1408～1535
+```
+
+这 127 个 token 跨越了两个 block，因此需要两个物理 page。
+
+只有当尾部刚好落在一个 block 内时，才能只占一个 page，例如：
+
+```text
+需要保留：token 1408～1535
+正好全部落在 block 11
+```
+
+所以上一回答中的“一层一个 block”应该修正为：
+
+> 每层有效 SWA payload 是 128 token；物理 page 数受 block 对齐影响，通常是 1～2 个。执行 chunked prefill 时还要额外覆盖当前 chunk。
+
+上游测试也验证了这一点：窗口外 token 只有在其所在的整个物理 block 都不再被窗口使用时，block 才能释放，见 [test_single_type_kv_cache_manager.py:735](D:/Code/vllm-github/tests/v1/core/test_single_type_kv_cache_manager.py:735)。
+
+例如测试中：
+
+```python
+# 5 tokens computed, block 1000 can be removed.
+manager.remove_skipped_blocks("test", 5)
+```
+
+在此之前，虽然部分 token 已经离开窗口，但因为同一个 block 里仍有窗口内 token，所以整个 block 不能释放。
+
+---
+
+## 三、chunk=512 时实际会临时保留多少 SWA block
+
+仍以：
+
+```text
+W = 128
+B = 128
+C = 512
+```
+
+为例。
+
+### 对齐较好的情况
+
+假设 chunk 从 token 1024 开始：
+
+```text
+历史尾部：897～1023
+当前 chunk：1024～1535
+```
+
+涉及：
+
+```text
+block 7 ：896～1023
+block 8 ：1024～1151
+block 9 ：1152～1279
+block 10：1280～1407
+block 11：1408～1535
+```
+
+共 5 个 block。
+
+### 起点不对齐的情况
+
+如果 chunk 从 token 1000 开始：
+
+```text
+历史尾部：873～999
+当前 chunk：1000～1511
+```
+
+覆盖 block 6～11，共 6 个 block。
+
+上游 admission 上限也会得到：
+
+\[
+\left\lceil \frac{127+512}{128}\right\rceil+1
+=5+1
+=\boxed{6\text{ blocks}}
+\]
+
+这里 6 是一个安全上限；具体执行时可能是 5，也可能是 6，取决于逻辑位置和物理 block 边界。
+
+如果 `max_num_batched_tokens=4096`，同步单 batch 下上限近似为：
+
+\[
+\left\lceil\frac{127+4096}{128}\right\rceil+1
+=33+1
+=\boxed{34\text{ blocks/SWA group}}
+\]
+
+若启用了异步调度或 PP，多批次可能同时 in-flight。当前 upstream 中：
+
+```python
+max_in_flight_tokens =
+    max_concurrent_batches * max_num_batched_tokens
+```
+
+见 [vllm.py:585](D:/Code/vllm-github/vllm/config/vllm.py:585)。这时 admission 预留还会更大。
+
+注意，这只是启动规划和准入时使用的上限，不代表每一步都真实占满。
+
+---
+
+## 四、完整执行过程
+
+### 1. Scheduler 为当前 chunk 分配 slot
+
+假设已经完成 `P` 个 token，现在调度 `C` 个 Prefill token。
+
+调度器调用：
+
+```python
+kv_cache_manager.allocate_slots(
+    request,
+    num_new_tokens=C,
+    ...
+)
+```
+
+入口在 [kv_cache_manager.py:371](D:/Code/vllm-github/vllm/v1/core/kv_cache_manager.py:371)。
+
+它首先释放已经确定不再属于 SWA window 的旧 block：
+
+```python
+self.coordinator.remove_skipped_blocks(
+    request.request_id,
+    max(
+        0,
+        total_computed_tokens - request.num_in_flight_tokens,
+    ),
+)
+```
+
+见 [kv_cache_manager.py:545](D:/Code/vllm-github/vllm/v1/core/kv_cache_manager.py:545)。
+
+这里减去 `num_in_flight_tokens` 非常重要：
+
+```text
+total_computed_tokens
+    ├─ 已真正完成且 settled 的 token
+    └─ 调度器已经乐观前移、但模型执行尚未返回的 token
+
+真正可以安全释放的边界
+    = total_computed_tokens - num_in_flight_tokens
+```
+
+也就是说，未完成 chunk 所需的历史 block 不会被提前释放。
+
+### 2. SlidingWindowManager 释放完整的旧 page
+
+`SlidingWindowManager` 继承通用的 `remove_skipped_blocks()`，见 [single_type_kv_cache_manager.py:681](D:/Code/vllm-github/vllm/v1/core/single_type_kv_cache_manager.py:681)。
+
+它先计算：
+
+```python
+num_skipped_tokens = self.get_num_skipped_tokens(
+    processed_computed_tokens
+)
+num_skipped_blocks = num_skipped_tokens // self.block_size
+```
+
+只有完全位于窗口之外的 block 才能释放。
+
+SWA 对应的 skipped-token 计算在 [single_type_kv_cache_manager.py:1144](D:/Code/vllm-github/vllm/v1/core/single_type_kv_cache_manager.py:1144)：
+
+```python
+return max(
+    0,
+    num_computed_tokens
+    - self.sliding_window
+    + 1
+    - self.extra_retained_tokens,
+)
+```
+
+旧 block 被释放后，不会从逻辑 block table 中删除，而是替换成 null block：
+
+```text
+原 block table：
+
+[18, 23, 41, 52, 60, 71]
+
+释放窗口外页后：
+
+[NULL, NULL, NULL, 52, 60, 71]
+```
+
+这样逻辑 token 位置不改变，但早期位置不再拥有实际 NPU page。
+
+### 3. 为当前 chunk 分配新的 block ID
+
+每个 KV cache group 的 manager 根据当前总 token 位置计算：
+
+```python
+num_required_blocks = ceil(num_tokens / block_size)
+```
+
+然后从共享 `BlockPool` 取得新的 block ID：
+
+```python
+new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+req_blocks.extend(new_blocks)
+```
+
+见 [single_type_kv_cache_manager.py:370](D:/Code/vllm-github/vllm/v1/core/single_type_kv_cache_manager.py:370)。
+
+因此当前 chunk 并没有单独的临时 tensor；它直接取得普通 paged KV block。
+
+### 4. block table 和 slot mapping 传给 Ascend worker
+
+Ascend metadata builder 最后把：
+
+```python
+block_table=common.block_table_tensor
+slot_mapping=slots
+flat_slot_mapping=flat_slots
+```
+
+封装到 `AscendDSAV41Metadata`，见 [dsa_v41.py:1528](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/attention/dsa_v41.py:1528)。
+
+对当前 chunk 的每个 token，`slot_mapping` 已经指出：
+
+```text
+token → global physical block ID → block 内 offset
+```
+
+### 5. 当前 chunk 的 SWA latent 写入 SWA cache
+
+Ascend 执行 `_preprocess()`：
+
+```python
+kv = self._project_kv(
+    attn,
+    cache_hidden,
+    kv_cos,
+    kv_sin,
+)
+self._write_swa_cache(
+    attn,
+    cache_metadata.swa,
+    kv,
+)
+```
+
+见 [dsa_v41.py:403](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/attention/dsa_v41.py:403)。
+
+实际写入函数见 [dsa_v41.py:349](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/attention/dsa_v41.py:349)：
+
+```python
+cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
+
+backend.write_attention_cache(
+    cache,
+    metadata.flat_slot_mapping[: value.shape[0]],
+    value,
+    kind="win",
+)
+```
+
+所以：
+
+> 未完成 Prefill chunk 的 KV 直接写进正常 SWA paged cache，不存在另一块专门叫“in-flight chunk cache”的临时缓存。
+
+### 6. source layer 还会另外写 main compressed KV
+
+如果当前层是 KV source，执行会继续调用：
+
+```python
+self._write_compressed_source(...)
+```
+
+见 [dsa_v41.py:430](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/attention/dsa_v41.py:430)。
+
+main compressed KV 使用的是：
+
+```python
+compressor_metadata.cache.slot_mapping
+```
+
+而 SWA 使用的是：
+
+```python
+metadata.swa.slot_mapping
+```
+
+main 写入位置见 [dsa_v41.py:550](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/attention/dsa_v41.py:550)。
+
+因此，同一个 source-layer 输入 token 会产生两类写入：
+
+```text
+原始 512-D SWA latent
+    └─ SWA group slot_mapping
+       └─ window cache
+
+压缩后的 main latent
+    └─ main/compressor group slot_mapping
+       └─ long compressed KV cache
+```
+
+ratio=2 时，并不是每个 token 都立即产生一个 main state；两个 token 完成一组后才写一个 compressed state。但每个当前 token 都需要 SWA 写入位置。
+
+### 7. Attention 同时读取两套 block table
+
+调用 `npu_sparse_flash_mla` 时，Ascend 分别传入：
+
+```python
+ori_kv=swa_cache
+cmp_kv=source_cache
+
+ori_block_table=metadata.swa.block_table
+cmp_block_table=metadata.attention.block_table
+```
+
+见 [dsa_v41.py:686](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/attention/dsa_v41.py:686)。
+
+这进一步证明：
+
+- SWA chunk page 和 main KV page 不是同一个逻辑 cache；
+- 两者有不同 block table；
+- 两者有不同 slot mapping；
+- 内核把它们分别作为 `ori_kv` 和 `cmp_kv` 使用。
+
+### 8. chunk 完成后再回收
+
+调度完成时，scheduler 会增加：
+
+```python
+request.num_in_flight_tokens += num_scheduled_token
+```
+
+见 [scheduler.py:1703](D:/Code/vllm-github/vllm/v1/core/sched/scheduler.py:1703)。
+
+模型输出返回后再减去：
+
+```python
+request.num_in_flight_tokens -= num_tokens_scheduled
+```
+
+见 [scheduler.py:2170](D:/Code/vllm-github/vllm/v1/core/sched/scheduler.py:2170)。
+
+下一次 `allocate_slots()` 时，前一个 chunk 已经 settled，scheduler 才能继续释放其窗口之外的 SWA pages。
+
+---
+
+## 五、这些 chunk SWA KV 和 main KV 在同一个物理 slot 吗？
+
+答案要分成两层。
+
+### 逻辑层：不是
+
+SWA 与 main KV 属于不同 cache group：
+
+| 项目 | SWA | Main compressed KV |
+|---|---|---|
+| metadata | `metadata.swa` | `metadata.attention/compressor` |
+| 写入映射 | `swa.slot_mapping` | `compressor.cache.slot_mapping` |
+| block table | `ori_block_table` | `cmp_block_table` |
+| 内核参数 | `ori_kv` | `cmp_kv` |
+| 生命周期 | window/chunk bounded | 随完整序列增长 |
+| 内容 | 未压缩 SWA latent | ratio-1/ratio-2 compressed latent |
+
+因此，未完成 chunk 的 SWA KV不会写进 main KV 的逻辑 page。
+
+### 物理 backing 层：会复用同一个四-slot backing tensor，但使用不同 block ID
+
+Ascend 的 `get_layer_tuples()` 把：
+
+- main KV
+- Index K
+- target SWA
+- draft SWA
+- compressor state
+
+组织成四个 source slot，见 [cache_config.py:153](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/models/deepseek_v41/cache_config.py:153)。
+
+SWA alias 在这里加入 source slot：
+
+```python
+aliases = (
+    [state[slot_idx]] if slot_idx < len(state) else []
+) + target_swa[slot_idx :: len(full)]
+```
+
+随后 page 容量取：
+
+```python
+capacity = max(
+    kv_bytes + index_bytes + folded_bytes,
+    *(specs[name].unpadded_page_size_bytes for name in aliases),
+)
+```
+
+见 [cache_config.py:171](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/models/deepseek_v41/cache_config.py:171)。
+
+物理上可以想象成：
+
+```text
+slot-0 backing tensor
+┌───────────────────────────┐
+│ page[0]   128 KiB         │
+│ page[1]   128 KiB         │
+│ page[2]   128 KiB         │
+│ ...                       │
+│ page[num_blocks-1]        │
+└───────────────────────────┘
+```
+
+同一个 page 根据“谁拥有该 block ID”被解释为不同布局：
+
+```text
+main group 获得 block ID = 100
+    slot-0 page[100]
+    解释为 layer-2 main KV + Index K
+
+某个 SWA group 获得 block ID = 900
+    slot-0 page[900]
+    解释为某一层 SWA KV
+
+另一个 SWA group 获得 block ID = 1200
+    slot-0 page[1200]
+    解释为另一层 SWA KV
+```
+
+所以准确答案是：
+
+> SWA chunk KV 与 main KV可以位于同一个物理 backing slot/tensor 中，但不会使用同一个正在占用的物理 page，也不会写到同一段有效地址。它们通过不同 cache group 从统一 BlockPool 获取互不冲突的 global block ID。
+
+上游 coordinator 只创建一个共享 `BlockPool`，然后把同一个 pool 传给所有 cache-group manager，见 [kv_cache_coordinator.py:94](D:/Code/vllm-github/vllm/v1/core/kv_cache_coordinator.py:94)。
+
+Ascend 的 cache 配置也明确写的是：
+
+```python
+"""Allocate independent layer slots backed by one global block-ID pool."""
+```
+
+并创建四个：
+
+```python
+KVCacheTensor(
+    size=num_blocks * page_size,
+    layers=list(layer_names),
+    layer_stride=0,
+    block_stride=page_size,
+)
+```
+
+见 [cache_config.py:265](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/models/deepseek_v41/cache_config.py:265)。
+
+---
+
+## 六、最终关系图
+
+```text
+                         一个共享 Global BlockPool
+                                   │
+                 ┌─────────────────┴─────────────────┐
+                 │                                   │
+        Main/Indexer cache group             SWA cache groups
+        分配 block ID：100...                 分配 block ID：900...
+                 │                                   │
+                 │ 不同 block ID，不冲突             │
+                 ▼                                   ▼
+┌────────────────────────────────────────────────────────────┐
+│ 四个物理 backing slot                                     │
+│                                                            │
+│ slot 0：source layer 2 backing                             │
+│   page[100]  → main KV + Index K                           │
+│   page[900]  → SWA layer 0                                 │
+│   page[901]  → 当前 Prefill chunk 的后续 SWA page          │
+│                                                            │
+│ slot 1：source layer 8 backing                             │
+│   page[100]  → main KV + Index K                           │
+│   page[900]  → SWA layer 1                                 │
+│                                                            │
+│ slot 2：source layer 14 backing                            │
+│   page[100]  → main KV + Index K                           │
+│   page[900]  → SWA layer 2                                 │
+│                                                            │
+│ slot 3：source layer 20 backing                            │
+│   page[100]  → main KV + Index K + folded Index K          │
+│   page[900]  → SWA layer 3                                 │
+└────────────────────────────────────────────────────────────┘
+```
+
+一句话总结：
+
+> 128 token 是每个 query 的 SWA 语义窗口，不是 chunked prefill 期间的物理 page 上限。当前 chunk 的所有 token 都要先在正常 SWA paged cache 中取得可写 slot，因此瞬时占用约为“历史窗口尾部 + 当前 chunk”；chunk settled 后，窗口之外的整页才在后续调度中被回收。SWA 与 main KV逻辑上完全分离、使用不同 block table 和 block ID，但在 Ascend 四-slot 设计中复用同一组物理 backing tensor。
+
+<oai-mem-citation>
+<citation_entries>
+MEMORY.md:297-305|note=[Used prior four-slot cache findings to identify the logical payload and physical backing distinction, then reverified against current commits]
+</citation_entries>
+<rollout_ids>
+01a13f65-851b-7881-ad41-9a27c830347a
+</rollout_ids>
+</oai-mem-citation>
+---
+
+## 问题 31：四物理 Slot 与 Chunked Prefill 的详细调用流程
+
+### 问题 31 原问题
+
+你上面的回答“四、完整执行过程  ”部分，请给出更加详细的调用流程图和对图里面过程的详细解释。
+
+### 问题 31 回答原文
+
+下面把“完整执行过程”拆成两条链路：
+
+1. **初始化阶段**：四个物理 slot 如何形成，以及 Main KV、SWA、Draft SWA、Compress State 如何复用它们。
+2. **单个 Chunked Prefill step**：调度器如何分配 block、生成 slot mapping、写入 cache、执行 attention，以及什么时候才能回收旧 SWA block。
+
+以下基于当前代码版本重新核对：
+
+- vLLM-Ascend：`2bd3b7fcd044c51b78e5943ac64dd8208e56b543`
+- upstream vLLM：`390836a3936629475696a2416378cf2f2aee8827`
+
+---
+
+## 一、初始化阶段：四个物理 slot 是怎么建立的
+
+```mermaid
+flowchart TD
+    A["DeepSeek V4.1 每个 Attention 层注册 CacheSpec"] --> A1["普通层：SWA CacheSpec"]
+    A --> A2["4 个 KV source 层：Long KV + Index K"]
+    A --> A3["ratio=2 source 层：Compress State"]
+    A --> A4["MTP/Draft 层：Draft SWA"]
+
+    A1 --> B["group_cache_specs"]
+    A2 --> B
+    A3 --> B
+    A4 --> B
+
+    B --> C["get_layer_tuples"]
+    C --> C0["找到 4 个 Long KV source<br/>形成 slot 0/1/2/3"]
+    C0 --> C1["slot i 主解释：Long KV + Index K + Folded Index"]
+    C0 --> C2["slot i 别名：State i"]
+    C0 --> C3["slot i 别名：SWA i、i+4、i+8..."]
+    C0 --> C4["slot i 别名：Draft SWA i"]
+
+    C1 --> D["计算 slot page capacity"]
+    C2 --> D
+    C3 --> D
+    C4 --> D
+
+    D --> E["capacity[i] = max<br/>Main组合大小, 各Alias页大小"]
+    E --> F["把逻辑CacheSpec重组为多个KV Cache Group"]
+
+    F --> F1["Main Group<br/>Long KV + Index K + Folded"]
+    F --> F2["State Group"]
+    F --> F3["Target SWA Group 0..N"]
+    F --> F4["Draft SWA Group"]
+
+    F1 --> G["get_deepseek_v41_kv_cache_config"]
+    F2 --> G
+    F3 --> G
+    F4 --> G
+
+    G --> H["创建4个物理Backing Tensor"]
+    H --> H0["slot 0 tensor: num_blocks × capacity[0]"]
+    H --> H1["slot 1 tensor: num_blocks × capacity[1]"]
+    H --> H2["slot 2 tensor: num_blocks × capacity[2]"]
+    H --> H3["slot 3 tensor: num_blocks × capacity[3]"]
+
+    H0 --> I["Coordinator 创建一个全局 BlockPool"]
+    H1 --> I
+    H2 --> I
+    H3 --> I
+
+    I --> J["所有Main/SWA/State/Draft group<br/>从同一个BlockPool领取全局唯一block_id"]
+```
+
+### 1. 各层首先注册逻辑 CacheSpec
+
+每个普通 Attention 层都会构造自己的 SWA cache：
+
+- [model.py:568](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/models/deepseek_v41/model.py:568) 定义 `AscendDeepseekV41SWACache`
+- [model.py:574](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/models/deepseek_v41/model.py:574) 根据配置得到物理 `block_size`
+- [model.py:575](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/models/deepseek_v41/model.py:575) 创建 `SlidingWindowSpec`
+- [model.py:632](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/models/deepseek_v41/model.py:632) 为当前层注册 `swa_cache_layer`
+
+此时它们还是“逻辑 cache”，并不意味着每一层都有一块独立的大 Tensor。
+
+### 2. 根据四个 KV source 层建立四个物理 slot
+
+进入 [cache_config.py:153](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/models/deepseek_v41/cache_config.py:153) 的 `get_layer_tuples()`：
+
+```python
+full = sorted(...long_kv_cache...)
+target_swa = sorted(...)
+draft_swa = sorted(...)
+```
+
+然后在 [cache_config.py:171-188](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/models/deepseek_v41/cache_config.py:171) 中，每个 Long KV source 对应一个物理 slot：
+
+```python
+for slot_idx, kv_name in enumerate(full):
+    ...
+    aliases = (
+        [state[slot_idx]]
+        + target_swa[slot_idx::len(full)]
+    )
+
+    if slot_idx < len(draft_swa):
+        aliases.append(draft_swa[slot_idx])
+```
+
+假设有 4 个 source 层，则分配关系是：
+
+| 物理 slot | Main 所有者 | Target SWA alias |
+|---|---|---|
+| slot 0 | source 0 的 Long KV / Index K | layer 0、4、8、12…… |
+| slot 1 | source 1 的 Long KV / Index K | layer 1、5、9、13…… |
+| slot 2 | source 2 的 Long KV / Index K | layer 2、6、10、14…… |
+| slot 3 | source 3 的 Long KV / Index K | layer 3、7、11、15…… |
+
+State 和 Draft SWA 也会被附加到相应 slot 的 alias 列表。
+
+### 3. `max(...)` 决定每个 slot 的页容量
+
+关键代码是 [cache_config.py:179-187](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/models/deepseek_v41/cache_config.py:179)：
+
+```python
+capacity = max(
+    kv_bytes + index_bytes + folded_bytes,
+    *(specs[name].unpadded_page_size_bytes for name in aliases),
+)
+```
+
+这表示：
+
+```text
+slot_page_capacity
+    = max(
+        Long KV + Index K + Folded Index,
+        State page,
+        各个 Target SWA page,
+        Draft SWA page
+      )
+```
+
+不是把这些空间全部相加。原因是这些逻辑 cache 使用相同物理 slot tensor，但通过不同的全局 `block_id` 使用不同 page。
+
+### 4. 逻辑 CacheSpec 被重新分组
+
+[cache_config.py:193-242](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/models/deepseek_v41/cache_config.py:193) 的 `group_cache_specs()` 将它们分成多个逻辑 cache group：
+
+- Main group：所有 Long KV、Index K、Folded Index
+- Compress State group
+- 多个 Target SWA group
+- Draft SWA group
+
+特别是 [cache_config.py:221-232](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/models/deepseek_v41/cache_config.py:221)：
+
+```python
+# Each scheduler SWA group takes one layer
+# from every tuple, so its members use distinct
+# slots at the same block ID.
+for names in zip(*swa_columns):
+    groups.append(...)
+```
+
+因此，一个 SWA group 中会包含来自四个物理 slot 的四个层。它们使用同一个逻辑 `block_id`，但分别落到 slot 0/1/2/3。
+
+### 5. 真正分配四个 backing tensor
+
+[cache_config.py:265-289](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/models/deepseek_v41/cache_config.py:265)：
+
+```python
+for page_size, layer_names in zip(page_sizes, layer_tuples):
+    size = num_blocks * page_size
+    tensors.append(
+        KVCacheTensor(
+            size=size,
+            layers=list(layer_names),
+            offset=0,
+            layer_stride=0,
+            block_stride=page_size,
+        )
+    )
+```
+
+所以每个物理 slot 实际是：
+
+```text
+slot_tensor[i]:
+    page 0
+    page 1
+    page 2
+    ...
+    page num_blocks-1
+```
+
+`layer_stride=0` 表示同一个 tuple 内的逻辑层从相同的 page 基址解释数据；`block_stride=page_size` 表示 `block_id` 不同就进入不同 page。
+
+### 6. 所有逻辑 group 共用一个 BlockPool
+
+Ascend coordinator 在 [patch_kv_cache_coordinator.py:152-158](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py:152) 只创建一个 `BlockPool`。
+
+随后 [patch_kv_cache_coordinator.py:177-189](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py:177) 把同一个 `self.block_pool` 传给每个 cache-group manager：
+
+```python
+get_manager_for_kv_cache_spec(
+    ...
+    block_pool=self.block_pool,
+    kv_cache_group_id=i,
+)
+```
+
+因此不同 group 得到的真实 block ID 不会冲突。
+
+---
+
+## 二、一次 Chunked Prefill 的完整运行流程
+
+下面假定：
+
+```text
+SWA window W = 128
+block_size B = 128
+当前 chunk 大小 C = 512
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as Scheduler
+    participant K as KVCacheManager
+    participant C as KVCacheCoordinator
+    participant G as 各Cache Group Manager
+    participant P as 全局BlockPool
+    participant R as Ascend ModelRunner
+    participant B as Metadata Builder
+    participant D as DSA V4.1 Attention
+    participant H as 四个物理Slot Tensor
+
+    S->>S: 决定本轮num_new_tokens=C
+    S->>K: allocate_slots(request, C)
+
+    K->>C: remove_skipped_blocks<br/>边界=total_computed-in_flight
+    C->>G: 逐group执行回收
+    G->>G: Main不回收历史
+    G->>G: SWA只回收已结算且完全离开窗口的整页
+    G->>G: State按Circular规则管理
+
+    K->>C: get_num_blocks_to_allocate
+    C->>G: 分别计算Main/SWA/State/Draft需求
+    G->>P: 请求新的全局block_id
+    P-->>G: 返回互不重复的block_id
+    G-->>K: 每个group的new_blocks
+
+    K-->>S: 分配成功
+    S->>S: num_computed += C<br/>num_in_flight += C
+    S-->>R: SchedulerOutput<br/>含每个group的block_ids
+
+    R->>R: 更新请求的各group block table
+    R->>R: 计算本chunk token positions
+    R->>R: compute_slot_mapping<br/>每个group分别生成映射
+
+    R->>B: 为每个KV cache group构造metadata
+    B-->>D: SWA metadata
+    B-->>D: Long KV metadata
+    B-->>D: Index K metadata
+    B-->>D: Compress State metadata
+
+    R->>D: 执行模型Attention forward
+    D->>H: 每层按SWA slot_mapping写当前chunk KV
+    D->>H: source层按Main/Index mapping写压缩KV
+    D->>H: ratio=2时更新Compress State
+
+    D->>H: 根据SWA block table读取局部窗口
+    D->>H: 根据Main block table读取稀疏选中的长期KV
+    H-->>D: ori_kv + cmp_kv
+    D-->>R: Attention输出
+
+    R-->>S: ModelRunnerOutput
+    S->>S: num_in_flight -= C
+    Note over S,K: 下一次allocate_slots时<br/>本chunk才进入可安全回收边界
+```
+
+---
+
+## 三、对运行流程逐步解释
+
+### 第 1 步：Scheduler 决定本轮 Prefill chunk 大小
+
+调度器确定 `num_new_tokens=C` 后，在 [scheduler.py:831-838](D:/Code/vllm-github/vllm/v1/core/sched/scheduler.py:831) 调用：
+
+```python
+new_blocks = self.kv_cache_manager.allocate_slots(
+    request,
+    num_new_tokens,
+    num_lookahead_tokens=self.num_lookahead_tokens,
+)
+```
+
+此时还没有执行模型，但当前 chunk 的所有 KV 写入位置必须预先分配好。
+
+### 第 2 步：先尝试回收已经安全离开 SWA window 的 block
+
+`KVCacheManager.allocate_slots()` 在分配新 block 之前，先调用：
+
+[本地 kv_cache_manager.py:546-559](D:/Code/vllm-github/vllm/v1/core/kv_cache_manager.py:546)
+
+```python
+self.coordinator.remove_skipped_blocks(
+    request.request_id,
+    max(
+        0,
+        total_computed_tokens
+        - request.num_in_flight_tokens
+    ),
+)
+```
+
+这里最关键的不是 `total_computed_tokens`，而是：
+
+```text
+processed boundary
+    = total_computed_tokens - num_in_flight_tokens
+```
+
+因为调度器会“乐观地”把已经调度、但尚未执行完成的 token 加到 `num_computed_tokens`。这些 token 的 KV 仍在写入或者可能被当前 Attention 使用，不能提前释放。
+
+### 第 3 步：SWA manager 计算有多少 token 已经完全离开窗口
+
+对于 SWA，回收边界由 [single_type_kv_cache_manager.py:1144-1179](D:/Code/vllm-github/vllm/v1/core/single_type_kv_cache_manager.py:1144) 给出：
+
+```python
+num_skipped_tokens = max(
+    0,
+    num_computed_tokens
+    - sliding_window
+    + 1
+    - extra_retained_tokens,
+)
+```
+
+当 `W=128`、没有额外 replay token 时，下一次计算之前需要保留前面的：
+
+```text
+W - 1 = 127 tokens
+```
+
+但回收是以整 block 为单位进行的：
+
+[single_type_kv_cache_manager.py:712-719](D:/Code/vllm-github/vllm/v1/core/single_type_kv_cache_manager.py:712)
+
+```python
+num_skipped_blocks = num_skipped_tokens // self.block_size
+self._remove_blocks_in_range(
+    request_id, 0, num_skipped_blocks
+)
+```
+
+因此，即使某个 block 中只有一个 token 仍位于窗口内，整个 block 也暂时不能释放。
+
+### 第 4 步：分别计算各 cache group 的 block 需求
+
+[本地 kv_cache_manager.py:561-570](D:/Code/vllm-github/vllm/v1/core/kv_cache_manager.py:561) 调用 coordinator：
+
+```python
+num_blocks_to_allocate = (
+    self.coordinator.get_num_blocks_to_allocate(...)
+)
+```
+
+不同 group 的语义不同：
+
+| Cache group | 本轮需要覆盖的逻辑范围 |
+|---|---|
+| Main Long KV / Index K | 从序列起点到当前压缩位置，随 1M 长度增长 |
+| Target SWA | 最近 `W-1` 个已结算 token，加当前 in-flight chunk |
+| Draft SWA | Draft/MTP 自己需要保留的局部窗口和活动 token |
+| Compress State | 压缩器尚未形成完整压缩记录的固定/循环状态 |
+
+单个 manager 最终按 [single_type_kv_cache_manager.py:400-407](D:/Code/vllm-github/vllm/v1/core/single_type_kv_cache_manager.py:400) 计算：
+
+```python
+num_required_blocks = cdiv(num_tokens, block_size)
+num_new_blocks = num_required_blocks - len(req_blocks)
+new_blocks = self.block_pool.get_new_blocks(
+    num_new_blocks
+)
+```
+
+### 第 5 步：为什么当前 chunk 会额外占用 SWA block
+
+`SlidingWindowSpec` 已经明确把 chunked prefill 的峰值定义成：
+
+[kv_cache_interface.py:917-929](D:/Code/vllm-github/vllm/v1/kv_cache_interface.py:917)
+
+```python
+num_tokens = min(
+    sliding_window - 1
+    + extra_retained_tokens
+    + max_in_flight_tokens,
+    max_model_len,
+)
+
+return cdiv(num_tokens, block_size) + 1
+```
+
+其中：
+
+```text
+历史 SWA：W - 1 = 127 tokens
+当前 chunk：C = 512 tokens
+合计：127 + 512 = 639 tokens
+```
+
+若起点恰好 block 对齐：
+
+```text
+ceil(639 / 128) = 5 blocks
+```
+
+若窗口左边界没有对齐，一个连续 639-token 区间可能横跨 6 个物理 block。因此 admission cap 额外 `+1`，覆盖最坏的未对齐情况。
+
+所以“128-token SWA 只需要一个 block”只适用于一种非常受限的描述：
+
+```text
+只看语义 window 大小
++ 不包含当前 in-flight chunk
++ 恰好按 block 对齐
+```
+
+在真实 chunked prefill 过程中，不能据此认为 SWA 始终只占一个物理 block。
+
+### 第 6 步：Scheduler 把当前 chunk 标记为 in-flight
+
+构造 `SchedulerOutput` 后，调度器在 [scheduler.py:1641-1643](D:/Code/vllm-github/vllm/v1/core/sched/scheduler.py:1641) 调用 `_update_after_schedule()`。
+
+[scheduler.py:1713-1717](D:/Code/vllm-github/vllm/v1/core/sched/scheduler.py:1713)：
+
+```python
+request.num_computed_tokens += num_scheduled_token
+request.num_in_flight_tokens += num_scheduled_token
+```
+
+这意味着：
+
+```text
+num_computed_tokens
+    = 已经完成的 token
+    + 已调度但尚未完成的 token
+```
+
+因此下一轮如果和本轮并发，回收代码必须减去 `num_in_flight_tokens`，否则会把当前执行仍然需要读取的 SWA page 提前释放。
+
+### 第 7 步：Worker 收到每个 group 的 block ID
+
+Ascend runner 在 [model_runner.py:985-1021](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/worker/v1/model_runner.py:985) 进入 `_update_states()`，随后调用父类更新请求状态。
+
+上游对应流程中：
+
+- 新请求在 [model_runner.py:1202-1240](D:/Code/vllm-github/vllm/v1/worker/gpu/model_runner.py:1202) 写入完整 `block_ids`
+- 已存在请求在 [model_runner.py:1257-1269](D:/Code/vllm-github/vllm/v1/worker/gpu/model_runner.py:1257) 追加 `new_block_ids`
+
+这里的 `block_ids` 是“按 cache group 分组”的，不是一张 Main/SWA 共用的 block table。
+
+### 第 8 步：为当前 chunk 的每个 token 计算 slot mapping
+
+Ascend runner 首先计算 token 的绝对 position：
+
+[model_runner.py:1415-1423](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/worker/v1/model_runner.py:1415)
+
+```python
+positions = num_computed_tokens + query_pos
+```
+
+然后在 [model_runner.py:1713-1717](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/worker/v1/model_runner.py:1713) 调用：
+
+```python
+self.input_batch.block_table.compute_slot_mapping(
+    num_reqs,
+    query_start_loc,
+    positions,
+)
+```
+
+`BlockTable.compute_slot_mapping()` 会遍历全部 active cache group：
+
+[block_table.py:525-531](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/worker/block_table.py:525)
+
+```python
+for block_table in self.block_tables:
+    block_table.compute_slot_mapping(
+        num_reqs,
+        query_start_loc,
+        positions,
+    )
+```
+
+所以同一个 token position 会得到多组地址：
+
+```text
+swa_slot_mapping[token]
+main_slot_mapping[token 或 compressed-row]
+index_slot_mapping[token 或 compressed-row]
+state metadata[token/request]
+draft_swa_slot_mapping[token]
+```
+
+它们不是同一个 mapping。
+
+### 第 9 步：每个 cache group 构造自己的 metadata
+
+Runner 在 [model_runner.py:3858-3882](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/worker/v1/model_runner.py:3858) 按 group 取出：
+
+```python
+blk_table = self.input_batch.block_table[kv_cache_gid]
+slot_mapping = blk_table.slot_mapping
+block_table_tensor = blk_table.get_device_tensor()
+```
+
+从第二个 group 开始，会在 [model_runner.py:4148-4151](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/worker/v1/model_runner.py:4148) 替换成当前 group 自己的 block table 和 slot mapping。
+
+最终 DeepSeek V4.1 每层看到的是：
+
+[dsa_v41.py:221-227](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/attention/dsa_v41.py:221)
+
+```python
+class DeepseekV41LayerMetadata:
+    attention: AscendDSAV41Metadata | None
+    swa: AscendDSAV41Metadata
+    compressor: DeepseekV41CompressorMetadata | None
+    indexer: DeepseekV41IndexerMetadata | None
+```
+
+其中 `_get_layer_metadata()` 在 [dsa_v41.py:327-340](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/attention/dsa_v41.py:327) 根据不同 prefix 分别取 SWA、Long KV、Index K 和 State metadata。
+
+### 第 10 步：当前 chunk 的普通层 KV 写入 SWA cache
+
+模型调用自定义算子：
+
+- [model.py:772](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/models/deepseek_v41/model.py:772)
+- [dsa_v41.py:61-69](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/attention/dsa_v41.py:61)
+
+随后 `_preprocess()` 执行：
+
+[dsa_v41.py:403-426](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/attention/dsa_v41.py:403)
+
+```python
+kv = self._project_kv(
+    attn,
+    cache_hidden,
+    kv_cos,
+    kv_sin,
+)
+self._write_swa_cache(
+    attn,
+    cache_metadata.swa,
+    kv,
+)
+```
+
+真正写入位置由 SWA 自己的 mapping 决定：
+
+[dsa_v41.py:349-361](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/attention/dsa_v41.py:349)
+
+```python
+cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
+
+backend.write_attention_cache(
+    cache,
+    metadata.flat_slot_mapping,
+    value,
+    kind="win",
+)
+```
+
+或者非 packed 后端：
+
+```python
+scatter_cache_sk(
+    cache,
+    metadata.slot_mapping,
+    value,
+)
+```
+
+因此，当前 Prefill chunk 的 SWA KV 没有放到一个单独的“临时 chunk buffer”里，而是直接写入正常 SWA paged cache。
+
+### 第 11 步：source 层额外写 Main KV、Index K 和 Compress State
+
+如果当前层是 KV source，`_preprocess()` 继续调用：
+
+[dsa_v41.py:430-438](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/attention/dsa_v41.py:430)
+
+```python
+self._write_compressed_source(...)
+```
+
+在 [dsa_v41.py:550-618](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/attention/dsa_v41.py:550)：
+
+- `ratio == 1`：每个 source 输入直接得到压缩 latent。
+- `ratio == 2`：先通过 `pool_projected()` 使用 Compress State 合并压缩组。
+- `index_slots` 来自 Index K group。
+- `long_slots` 来自 Long KV/Main group。
+
+```python
+index_slots = indexer_metadata.cache.slot_mapping
+long_slots = compressor_metadata.cache.slot_mapping
+
+attn.indexer.update_keys(
+    latent,
+    index_slots,
+    ...
+)
+
+scatter_cache_sk(
+    attn.long_kv_cache.kv_cache[0],
+    long_slots,
+    latent,
+)
+```
+
+所以 source 层的当前 chunk 可能同时产生：
+
+```text
+当前 token 的 SWA latent
+压缩完成后的 Main KV latent
+对应 Index K
+尚未完成压缩组的 Compress State
+```
+
+但这四类内容依旧使用各自 group 的 mapping。
+
+### 第 12 步：Attention 同时读取 SWA 和 Main KV
+
+稀疏 Attention 阶段分别取得两套 block table：
+
+[dsa_v41.py:688-704](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/attention/dsa_v41.py:688)
+
+```python
+ori_block_table = metadata.swa.block_table
+cmp_block_table = metadata.attention.block_table
+```
+
+最后传给算子：
+
+[dsa_v41.py:718-730](D:/Code/vllm-ascend/vllm-ascend/vllm_ascend/attention/dsa_v41.py:718)
+
+```python
+npu_sparse_flash_mla(
+    q,
+    ori_kv=swa_cache,
+    cmp_kv=source_cache,
+    ori_block_table=ori_block_table,
+    cmp_block_table=cmp_block_table,
+    ...
+)
+```
+
+也就是说：
+
+```text
+ori_kv / ori_block_table = SWA 历史 + 当前 chunk
+cmp_kv / cmp_block_table = 长期压缩 Main KV
+```
+
+### 第 13 步：执行完成后，当前 chunk 才退出 in-flight
+
+Scheduler 收到输出时执行：
+
+[scheduler.py:2170-2176](D:/Code/vllm-github/vllm/v1/core/sched/scheduler.py:2170)
+
+```python
+request.num_in_flight_tokens -= num_tokens_scheduled
+```
+
+到下一次 `allocate_slots()` 时，这批 token 才进入“已经处理完成，可以据此推进 SWA 左边界”的范围。
+
+---
+
+## 四、Main KV 和当前 chunk 的 SWA 是否保存在同一个物理 slot
+
+这个问题需要区分三层含义：
+
+```mermaid
+flowchart LR
+    P["同一个全局BlockPool"] --> M["Main Group领取 block_id=M"]
+    P --> S["SWA Group领取 block_id=S"]
+    P --> T["State Group领取 block_id=T"]
+    P --> D["Draft Group领取 block_id=D"]
+
+    M --> P0["slot0.page[M]<br/>Long KV + Index"]
+    M --> P1["slot1.page[M]<br/>Long KV + Index"]
+    M --> P2["slot2.page[M]<br/>Long KV + Index"]
+    M --> P3["slot3.page[M]<br/>Long KV + Index"]
+
+    S --> S0["slot0.page[S]<br/>某Target SWA层"]
+    S --> S1["slot1.page[S]<br/>某Target SWA层"]
+    S --> S2["slot2.page[S]<br/>某Target SWA层"]
+    S --> S3["slot3.page[S]<br/>某Target SWA层"]
+
+    T --> T0["slot*.page[T]<br/>Compress State"]
+    D --> D0["slot*.page[D]<br/>Draft SWA"]
+```
+
+结论如下：
+
+| “同一个物理 slot”的含义 | 答案 |
+|---|---|
+| 是否都复用四个顶层 backing tensor | **是** |
+| 是否使用同一个 `block_id` | **否** |
+| 是否使用同一张 block table | **否** |
+| 是否使用同一组 slot mapping | **否** |
+| 是否落到同一个 page/同一段字节地址 | **否** |
+| 当前 chunk SWA 和历史 SWA 是否属于同一个 SWA cache | **是**，只是不同/滚动的 SWA page |
+
+例如：
+
+```text
+slot 0 tensor
+├── page 17：Main group 使用
+│   ├── Long KV 区域
+│   └── Index K / Folded 区域
+│
+├── page 42：Target SWA group 使用
+│   └── 当前层的 SWA KV
+│
+├── page 58：Compress State group 使用
+│   └── 压缩器循环状态
+│
+└── page 73：Draft SWA group 使用
+    └── Draft SWA KV
+```
+
+虽然它们都在 `slot 0 tensor` 中，但 `17、42、58、73` 是全局 BlockPool 分配的不同 block ID，所以实际地址不同：
+
+```text
+address = slot_tensor_base
+        + block_id × page_capacity
+        + cache内部偏移
+```
+
+因此最准确的表述是：
+
+> 当前 Prefill chunk 的 SWA KV 与 Main KV 会复用同一组“四个物理 backing slot tensor”，但不会写入同一个物理 page。Main、SWA、Draft SWA 和 Compress State 拥有独立的逻辑 cache group、block table 和 slot mapping；共享 BlockPool 保证它们获得互不冲突的全局 block ID。
+
+而“每层 SWA 只需一个 128-token block”描述的是理想对齐、没有在途 chunk 的语义窗口。真实 chunked prefill 执行期间，必须同时容纳 `W-1` 个安全历史 token 和当前尚未结算的 chunk；以 `W=128、C=512、B=128` 为例，SWA 峰值是 639 个 token，对齐时 5 个 block，最坏未对齐时 6 个 block。
+
+<oai-mem-citation>
+<citation_entries>
+MEMORY.md:301-304|note=[Used prior four-slot cache topic as navigation and reverified all claims against current commits]
+MEMORY.md:297-299|note=[Kept logical rows candidate blocks physical pages and static evidence distinct]
+</citation_entries>
+<rollout_ids>
+01a13f65-851b-7881-ad41-9a27c830347a
+</rollout_ids>
+</oai-mem-citation>
